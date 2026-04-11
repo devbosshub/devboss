@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: devboss-backend
+Version: 0.1.0
+Summary: Dev Boss FastAPI backend
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: sqlalchemy>=2.0.35
+Requires-Dist: psycopg[binary]>=3.2.1
+Requires-Dist: docker>=7.1.0
+Requires-Dist: pydantic>=2.9.0
+Requires-Dist: pydantic-settings>=2.5.2
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: httpx>=0.27.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.3; extra == "dev"
+
+# Dev Boss Backend
+
+FastAPI application for Dev Boss APIs, orchestration logic, local artifact storage, and agent runtime endpoints.
+
