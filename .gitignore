@@ -1,7 +1,6 @@
 .DS_Store
 .env
 .env.local
-.env.*
 .venv/
 __pycache__/
 *.pyc
