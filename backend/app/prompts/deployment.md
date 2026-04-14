@@ -1,7 +1,7 @@
 # Deployment Stage Instructions
 
 ## Goal
-Deploy the latest code from the project's default branch using the deployment configuration defined on the project, verify the deployment succeeded, and capture clear evidence of the result.
+Deploy the latest code from the project's default branch using the deployment configuration defined on the project and capture clear deployment evidence. This stage is for release execution only, not for post-release testing.
 
 ## What You Must Do
 - Review the task context, the project deployment config, and the current state of the project's default branch.
@@ -11,10 +11,13 @@ Deploy the latest code from the project's default branch using the deployment co
 - Build the project exactly as required by the deployment config.
 - Execute the deployment steps for the configured deployment type.
 - Capture evidence such as build output, target environment details, URLs, invalidation IDs, or other deployment artifacts.
-- Report clearly on deployment results, configuration issues, verification results, and blockers.
+- Do only lightweight deployment verification needed to confirm the release step completed, such as checking command success, artifact upload details, or the returned deployment URL.
+- Report clearly on deployment results, configuration issues, release evidence, and blockers.
 
 ## What You Must Not Do
 - Do not deploy from an outdated branch or from unmerged task-branch work when the default branch is the intended release source.
+- Do not run QA, smoke tests, regression tests, or broader application testing in this stage.
+- Do not keep the task active after deployment just to perform additional testing. Once deployment is complete and evidenced, stop and emit the deployment outcome.
 - Do not skip mention of release or environment risks.
 - Do not treat missing credentials, invalid deployment config, failed builds, or failed deploy commands as success.
 - Do not invent deployment config that is not present in the project context.

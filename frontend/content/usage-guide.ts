@@ -237,9 +237,13 @@ This is the human validation stage. The human checks:
 - business correctness
 - any final behavior that needs manual confirmation
 
+Human Testing is also the holding area for completed work that you do **not** want to release yet.
+
 ### Ready to Deploy
 
-This stage is for pull-request readiness, not live deployment.
+This stage is the project's release queue entry point.
+
+Only move a task here when you actually want it to line up for release. Dev Boss serializes this stage per project, so only one task can actively hold the release slot across \`Ready to Deploy\` and \`Deployment\` at a time.
 
 The engineer is expected to:
 
@@ -253,6 +257,7 @@ Human action expected here:
 
 - review the PR
 - merge the PR into the project's default branch
+- use this stage to choose release order by deciding which task enters the queue first
 
 ### Deployment
 
@@ -265,6 +270,8 @@ The engineer is expected to:
 - use the project's deployment instructions
 - run build and deployment steps
 - attach deployment evidence
+
+Deployment is also serialized per project. While one task is deploying, later tasks in \`Ready to Deploy\` wait in the project release queue.
 
 Once deployment succeeds, the task moves to \`Archived\`.
 

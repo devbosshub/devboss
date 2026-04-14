@@ -1,12 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 
 import { ConfirmModal } from "@/components/confirm-modal";
 import { LayoutShell } from "@/components/layout-shell";
 import { api } from "@/lib/api";
-import { Engineer } from "@/lib/types";
+import { Engineer, EngineerRuntime } from "@/lib/types";
 
 const templateLabels: Record<string, string> = {
   backend_engineer: "Backend Engineer",
@@ -108,10 +108,14 @@ function ActionIcon({ kind }: { kind: "launch" | "stop" | "restart" | "edit" | "
   );
 }
 
+type ConfirmAction =
+  | { kind: "stop-runtime" | "restart-runtime"; engineerName: string; runtime: EngineerRuntime }
+  | { kind: "delete-engineer"; engineer: Engineer };
+
 export default function EngineersPage() {
   const [engineers, setEngineers] = useState<Engineer[]>([]);
-  const [activeEngineerId, setActiveEngineerId] = useState<number | null>(null);
-  const [confirmAction, setConfirmAction] = useState<{ kind: "stop" | "restart" | "delete"; engineer: Engineer } | null>(null);
+  const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
   const [isPending, startTransition] = useTransition();
 
   const loadEngineers = async () => {
@@ -124,29 +128,62 @@ export default function EngineersPage() {
   }, []);
 
   useEffect(() => {
-    const interval = window.setInterval(loadEngineers, 30000);
+    const interval = window.setInterval(loadEngineers, 15000);
     return () => window.clearInterval(interval);
   }, []);
 
-  const executeLifecycleAction = async (engineer: Engineer, kind: "stop" | "restart" | "delete") => {
-    setActiveEngineerId(engineer.id);
+  const executeAction = async (action: ConfirmAction) => {
+    if (action.kind === "delete-engineer") {
+      setActiveKey(`engineer-${action.engineer.id}`);
+      try {
+        await api.deleteEngineer(action.engineer.id);
+        await loadEngineers();
+      } finally {
+        setActiveKey(null);
+      }
+      return;
+    }
+
+    setActiveKey(`runtime-${action.runtime.id}`);
     try {
-      if (kind === "delete") {
-        await api.deleteEngineer(engineer.id);
+      if (action.kind === "stop-runtime") {
+        await api.stopEngineerRuntime(action.runtime.id);
       } else {
-        await api.stopEngineer(engineer.id);
-        if (kind === "restart") {
-          await api.launchEngineer(engineer.id);
-        }
+        await api.restartEngineerRuntime(action.runtime.id);
       }
       await loadEngineers();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Engineer action failed.";
-      window.alert(message);
     } finally {
-      setActiveEngineerId(null);
+      setActiveKey(null);
     }
   };
+
+  const confirmText = useMemo(() => {
+    if (!confirmAction) {
+      return null;
+    }
+    if (confirmAction.kind === "delete-engineer") {
+      return {
+        title: "Delete engineer?",
+        label: "Delete engineer",
+        className: "button danger",
+        description: `This will permanently delete ${confirmAction.engineer.name}. Make sure no tasks are assigned and all runtime instances are stopped first.`
+      };
+    }
+
+    return confirmAction.kind === "restart-runtime"
+      ? {
+          title: "Restart runtime?",
+          label: "Restart runtime",
+          className: "button",
+          description: `This will restart runtime #${confirmAction.runtime.id} for ${confirmAction.engineerName}.`
+        }
+      : {
+          title: "Stop runtime?",
+          label: "Stop runtime",
+          className: "button danger",
+          description: `This will stop runtime #${confirmAction.runtime.id} for ${confirmAction.engineerName}.`
+        };
+  }, [confirmAction]);
 
   return (
     <LayoutShell
@@ -165,23 +202,9 @@ export default function EngineersPage() {
       }
     >
       <ConfirmModal
-        confirmClassName={confirmAction?.kind === "restart" ? "button" : "button danger"}
-        confirmLabel={
-          confirmAction?.kind === "restart"
-            ? "Restart engineer"
-            : confirmAction?.kind === "delete"
-              ? "Delete engineer"
-              : "Stop engineer"
-        }
-        description={
-          confirmAction
-            ? confirmAction.kind === "restart"
-              ? `This will stop and immediately relaunch ${confirmAction.engineer.name}'s runtime container.`
-              : confirmAction.kind === "delete"
-                ? `This will stop ${confirmAction.engineer.name}'s runtime container if needed and permanently delete the engineer record.`
-                : `This will stop ${confirmAction.engineer.name}'s runtime container.`
-            : ""
-        }
+        confirmClassName={confirmText?.className ?? "button"}
+        confirmLabel={confirmText?.label ?? "Confirm"}
+        description={confirmText?.description ?? ""}
         onCancel={() => setConfirmAction(null)}
         onConfirm={async () => {
           if (!confirmAction) {
@@ -190,24 +213,23 @@ export default function EngineersPage() {
           const nextAction = confirmAction;
           setConfirmAction(null);
           startTransition(async () => {
-            await executeLifecycleAction(nextAction.engineer, nextAction.kind);
+            try {
+              await executeAction(nextAction);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "Engineer action failed.";
+              window.alert(message);
+            }
           });
         }}
         open={confirmAction !== null}
-        title={
-          confirmAction?.kind === "restart"
-            ? "Restart engineer?"
-            : confirmAction?.kind === "delete"
-              ? "Delete engineer?"
-              : "Stop engineer?"
-        }
+        title={confirmText?.title ?? "Confirm action"}
       />
       <section className="panel">
         <div className="section-header">
           <div>
             <div className="eyebrow">Engineers</div>
             <h1>Engineer registry</h1>
-            <p className="muted">Manage Codex-powered engineer profiles, runtime settings, and specialization templates.</p>
+            <p className="muted">Launch multiple runtime containers per engineer and let queued tasks wait for the next free runtime.</p>
           </div>
         </div>
 
@@ -222,8 +244,9 @@ export default function EngineersPage() {
                   <th>Template</th>
                   <th>Model</th>
                   <th>Docker image</th>
-                  <th>Running for</th>
+                  <th>Runtime capacity</th>
                   <th>Runtime status</th>
+                  <th>Runtime instances</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -234,7 +257,7 @@ export default function EngineersPage() {
                     <td>{templateLabels[engineer.template] ?? engineer.template}</td>
                     <td>{engineer.model_name}</td>
                     <td className="table-wrap">{engineer.docker_image}</td>
-                    <td>{formatRuntimeDuration(engineer.runtime_started_at)}</td>
+                    <td>{engineer.healthy_runtime_count}/{engineer.runtime_count || 0} healthy</td>
                     <td>
                       <div className="stack-compact">
                         <span
@@ -248,60 +271,85 @@ export default function EngineersPage() {
                         >
                           {runtimeStatusLabels[engineer.runtime_status] ?? engineer.runtime_status}
                         </span>
-                        {engineer.runtime_status_message ? (
-                          <span className="table-subtext">{engineer.runtime_status_message}</span>
-                        ) : null}
+                        {engineer.runtime_status_message ? <span className="table-subtext">{engineer.runtime_status_message}</span> : null}
                       </div>
+                    </td>
+                    <td>
+                      {engineer.runtimes.length === 0 ? (
+                        <span className="muted">No runtime instances</span>
+                      ) : (
+                        <div className="stack-compact">
+                          {engineer.runtimes.map((runtime) => {
+                            const runtimeKey = `runtime-${runtime.id}`;
+                            const isBusy = runtime.current_task_run_id !== null;
+                            const isRunning = ["starting", "healthy", "heartbeat_missing"].includes(runtime.runtime_status);
+                            return (
+                              <div className="table-runtime-row" key={runtime.id}>
+                                <div className="table-runtime-meta">
+                                  <span className={`tag compact${runtime.runtime_status === "healthy" ? "" : runtime.runtime_status === "heartbeat_missing" || runtime.runtime_status === "launch_failed" ? " danger" : " warning"}`}>
+                                    #{runtime.id} {runtimeStatusLabels[runtime.runtime_status] ?? runtime.runtime_status}
+                                  </span>
+                                  <span className="table-subtext">
+                                    Running for {formatRuntimeDuration(runtime.started_at)}{isBusy ? ` • Task run #${runtime.current_task_run_id}` : ""}
+                                  </span>
+                                </div>
+                                <div className="table-actions">
+                                  {isRunning ? (
+                                    <>
+                                      <button
+                                        aria-label="Restart runtime"
+                                        className="icon-button warning"
+                                        disabled={activeKey === runtimeKey || isPending}
+                                        onClick={() => setConfirmAction({ kind: "restart-runtime", engineerName: engineer.name, runtime })}
+                                        title="Restart runtime"
+                                        type="button"
+                                      >
+                                        <ActionIcon kind="restart" />
+                                      </button>
+                                      <button
+                                        aria-label="Stop runtime"
+                                        className="icon-button danger"
+                                        disabled={activeKey === runtimeKey || isPending}
+                                        onClick={() => setConfirmAction({ kind: "stop-runtime", engineerName: engineer.name, runtime })}
+                                        title="Stop runtime"
+                                        type="button"
+                                      >
+                                        <ActionIcon kind="stop" />
+                                      </button>
+                                    </>
+                                  ) : null}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </td>
                     <td className="action-cell">
                       <div className="table-actions">
-                        {engineer.runtime_status === "healthy" ||
-                        engineer.runtime_status === "starting" ||
-                        engineer.runtime_status === "heartbeat_missing" ? (
-                          <>
-                            <button
-                              aria-label="Restart engineer"
-                              className="icon-button warning"
-                              disabled={activeEngineerId === engineer.id || isPending}
-                              onClick={() => setConfirmAction({ kind: "restart", engineer })}
-                              title={isPending && activeEngineerId === engineer.id ? "Restarting..." : "Restart engineer"}
-                              type="button"
-                            >
-                              <ActionIcon kind="restart" />
-                            </button>
-                            <button
-                              aria-label="Stop engineer"
-                              className="icon-button danger"
-                              disabled={activeEngineerId === engineer.id || isPending}
-                              onClick={() => setConfirmAction({ kind: "stop", engineer })}
-                              title={isPending && activeEngineerId === engineer.id ? "Stopping..." : "Stop engineer"}
-                              type="button"
-                            >
-                              <ActionIcon kind="stop" />
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            aria-label="Launch engineer"
-                            className="icon-button success"
-                            disabled={activeEngineerId === engineer.id || isPending}
-                            onClick={() =>
-                              startTransition(async () => {
-                                setActiveEngineerId(engineer.id);
-                                try {
-                                  await api.launchEngineer(engineer.id);
-                                  await loadEngineers();
-                                } finally {
-                                  setActiveEngineerId(null);
-                                }
-                              })
-                            }
-                            title={isPending && activeEngineerId === engineer.id ? "Launching..." : "Launch engineer"}
-                            type="button"
-                          >
-                            <ActionIcon kind="launch" />
-                          </button>
-                        )}
+                        <button
+                          aria-label="Launch new runtime"
+                          className="icon-button success"
+                          disabled={activeKey === `engineer-${engineer.id}` || isPending}
+                          onClick={() =>
+                            startTransition(async () => {
+                              setActiveKey(`engineer-${engineer.id}`);
+                              try {
+                                await api.launchEngineer(engineer.id);
+                                await loadEngineers();
+                              } catch (error) {
+                                const message = error instanceof Error ? error.message : "Runtime launch failed.";
+                                window.alert(message);
+                              } finally {
+                                setActiveKey(null);
+                              }
+                            })
+                          }
+                          title="Launch another runtime"
+                          type="button"
+                        >
+                          <ActionIcon kind="launch" />
+                        </button>
                         <Link
                           aria-label="Edit engineer"
                           className="icon-button"
@@ -313,9 +361,9 @@ export default function EngineersPage() {
                         <button
                           aria-label="Delete engineer"
                           className="icon-button danger"
-                          disabled={activeEngineerId === engineer.id || isPending}
-                          onClick={() => setConfirmAction({ kind: "delete", engineer })}
-                          title={isPending && activeEngineerId === engineer.id ? "Deleting..." : "Delete engineer"}
+                          disabled={activeKey === `engineer-${engineer.id}` || isPending}
+                          onClick={() => setConfirmAction({ kind: "delete-engineer", engineer })}
+                          title="Delete engineer"
                           type="button"
                         >
                           <ActionIcon kind="delete" />

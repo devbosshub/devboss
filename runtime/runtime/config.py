@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class RuntimeSettings(BaseSettings):
     api_base_url: str = "http://backend:8000"
     engineer_id: int = 1
+    runtime_id: int = 1
     poll_interval_seconds: int = 15
     workspace_dir: str = "/tmp/devboss-runtime"
     codex_command: str = "codex"

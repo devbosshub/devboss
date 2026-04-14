@@ -18,6 +18,7 @@ ALLOWED_OUTCOMES_BY_STATUS = {
     "ready_to_deploy": {"needs_human_input", "deployment_complete", "blocked", "failed"},
     "deployed": {"needs_human_input", "deployment_complete", "blocked", "failed"},
 }
+PR_URL_ALLOWED_STATUSES = {"ready_to_deploy", "deployed"}
 
 
 def truncate_output(output: str, limit: int = 6000) -> str:
@@ -78,6 +79,8 @@ def branch_to_clone(task: dict, project: dict) -> str:
 def normalize_outcome_for_task(task: dict, outcome: dict) -> dict:
     allowed_outcomes = ALLOWED_OUTCOMES_BY_STATUS.get(task["status"], set())
     if outcome["outcome_type"] in allowed_outcomes:
+        if task["status"] not in PR_URL_ALLOWED_STATUSES:
+            outcome["pr_url"] = None
         return outcome
     allowed_list = ", ".join(sorted(allowed_outcomes)) or "none"
     return {
@@ -104,7 +107,7 @@ def start_heartbeat_loop(
     def heartbeat() -> None:
         while not stop_event.is_set():
             client.engineer_heartbeat(
-                settings.engineer_id,
+                settings.runtime_id,
                 container_name=settings.effective_container_name,
                 container_id=container_id,
                 status_message="Engineer runtime is active.",
@@ -125,7 +128,7 @@ def run_loop() -> None:
 
     while True:
         client.engineer_heartbeat(
-            settings.engineer_id,
+            settings.runtime_id,
             container_name=settings.effective_container_name,
             container_id=container_id,
             status_message="Runtime heartbeat received from engineer container.",
@@ -135,7 +138,7 @@ def run_loop() -> None:
             time.sleep(settings.heartbeat_interval_seconds)
             continue
 
-        payload = client.poll_next_task(settings.engineer_id)
+        payload = client.poll_next_task(settings.runtime_id)
         task_run = payload.get("task_run")
         task = payload.get("task")
 

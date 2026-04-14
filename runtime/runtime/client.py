@@ -18,8 +18,8 @@ class DevBossClient:
                 raise RuntimeError(f"{exc}. Response body: {detail}") from exc
             raise
 
-    def poll_next_task(self, engineer_id: int) -> dict:
-        response = self.client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    def poll_next_task(self, runtime_id: int) -> dict:
+        response = self.client.post("/agent/poll-next-task", json={"runtime_id": runtime_id})
         self._raise_for_status(response)
         return response.json()
 
@@ -40,13 +40,13 @@ class DevBossClient:
 
     def engineer_heartbeat(
         self,
-        engineer_id: int,
+        runtime_id: int,
         container_name: str,
         container_id: str | None,
         status_message: str,
     ) -> dict:
         response = self.client.post(
-            f"/engineers/{engineer_id}/heartbeat",
+            f"/engineer-runtimes/{runtime_id}/heartbeat",
             json={
                 "container_name": container_name,
                 "container_id": container_id,

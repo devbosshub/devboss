@@ -54,6 +54,24 @@ export type Engineer = {
   runtime_status_message: string | null;
   runtime_started_at: string | null;
   runtime_last_heartbeat_at: string | null;
+  runtime_count: number;
+  healthy_runtime_count: number;
+  busy_runtime_count: number;
+  runtimes: EngineerRuntime[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type EngineerRuntime = {
+  id: number;
+  engineer_id: number;
+  runtime_status: EngineerRuntimeStatus;
+  container_name: string | null;
+  container_id: string | null;
+  status_message: string | null;
+  started_at: string | null;
+  last_heartbeat_at: string | null;
+  current_task_run_id: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -71,6 +89,7 @@ export type TaskRun = {
   id: number;
   task_id: number;
   engineer_id: number;
+  claimed_by_runtime_id: number | null;
   phase: string;
   status: string;
   outcome_type: string | null;
@@ -109,6 +128,7 @@ export type Task = {
   pr_url: string | null;
   deploy_url: string | null;
   blocked_reason: string | null;
+  release_queue_entered_at?: string | null;
   created_at: string;
   updated_at: string;
   comments: TaskComment[];

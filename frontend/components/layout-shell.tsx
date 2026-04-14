@@ -67,11 +67,6 @@ export function LayoutShell({
                   <div className="topbar-title">Dev Boss Workspace</div>
                   <div className="topbar-meta">Monitor AI execution, unblock approvals, and keep delivery moving.</div>
                 </div>
-                <div className="topbar-actions">
-                  <div className="topbar-pill">Projects</div>
-                  <div className="topbar-pill">Engineers</div>
-                  <div className="topbar-pill">Task Runs</div>
-                </div>
               </>
             )}
           </header>

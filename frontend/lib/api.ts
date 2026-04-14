@@ -85,6 +85,10 @@ export const api = {
     request<Engineer>(`/engineers/${engineerId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   launchEngineer: (engineerId: number) => request<Engineer>(`/engineers/${engineerId}/launch`, { method: "POST" }),
   stopEngineer: (engineerId: number) => request<Engineer>(`/engineers/${engineerId}/stop`, { method: "POST" }),
+  stopEngineerRuntime: (runtimeId: number) =>
+    request(`/engineer-runtimes/${runtimeId}/stop`, { method: "POST" }),
+  restartEngineerRuntime: (runtimeId: number) =>
+    request(`/engineer-runtimes/${runtimeId}/restart`, { method: "POST" }),
   deleteEngineer: (engineerId: number) =>
     requestWithoutBody<{ deleted: boolean }>(`/engineers/${engineerId}`, { method: "DELETE" }),
   createTask: (payload: Partial<Task>) => request<Task>("/tasks", { method: "POST", body: JSON.stringify(payload) }),

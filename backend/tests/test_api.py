@@ -1,4 +1,19 @@
 from app import main as main_module
+from app.enums import EngineerRuntimeStatus
+from app.models import EngineerRuntime
+
+
+def create_runtime(db_session, engineer_id: int, status: EngineerRuntimeStatus = EngineerRuntimeStatus.HEALTHY) -> EngineerRuntime:
+    runtime = EngineerRuntime(
+        engineer_id=engineer_id,
+        runtime_status=status,
+        container_name=f"devboss-engineer-{engineer_id}-test",
+        container_id=f"container-{engineer_id}",
+    )
+    db_session.add(runtime)
+    db_session.commit()
+    db_session.refresh(runtime)
+    return runtime
 
 
 def test_create_project_and_task_flow(client):
@@ -42,7 +57,7 @@ def test_create_project_and_task_flow(client):
     assert len(lanes["ai_grooming"]) == 1
 
 
-def test_agent_poll_and_outcome_flow(client):
+def test_agent_poll_and_outcome_flow(client, db_session):
     project_id = client.post(
         "/projects",
         json={
@@ -67,8 +82,9 @@ def test_agent_poll_and_outcome_flow(client):
         },
     ).json()
     task_run_id = task["task_runs"][0]["id"]
+    runtime = create_runtime(db_session, engineer_id)
 
-    poll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_response.status_code == 200
     payload = poll_response.json()
     assert payload["task"]["id"] == task["id"]
@@ -104,7 +120,7 @@ def test_agent_poll_and_outcome_flow(client):
     assert latest_comment["action_required"] is True
 
 
-def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_after_success(client):
+def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_after_success(client, db_session):
     project_id = client.post(
         "/projects",
         json={
@@ -130,8 +146,9 @@ def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_a
         },
     ).json()
     release_prep_run_id = task["task_runs"][0]["id"]
+    runtime = create_runtime(db_session, engineer_id)
 
-    poll_release_prep = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_release_prep = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_release_prep.status_code == 200
     release_prep_payload = poll_release_prep.json()
     assert release_prep_payload["task"]["status"] == "ready_to_deploy"
@@ -166,7 +183,7 @@ def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_a
     assert deployment_ready_task["task_runs"][-1]["status"] == "pending"
 
     deployment_run_id = deployment_ready_task["task_runs"][-1]["id"]
-    poll_deployment = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_deployment = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_deployment.status_code == 200
     deployment_payload = poll_deployment.json()
     assert deployment_payload["task"]["status"] == "deployed"
@@ -188,6 +205,230 @@ def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_a
     archived_task = client.get(f"/tasks/{task['id']}").json()
     assert archived_task["status"] == "archived"
     assert archived_task["deploy_url"] == "https://app.example.com"
+
+
+def test_release_queue_serializes_ready_to_deploy_and_deployment_per_project(client, db_session):
+    project_id = client.post(
+        "/projects",
+        json={
+            "name": "Release Queue",
+            "repo_url": "https://github.com/acme/release-queue",
+            "default_branch": "main",
+            "deploy_config": {"type": "frontend_static_s3"},
+            "deployment_instructions": "Prepare PRs and deploy from main.",
+            "engineer_pool": [],
+        },
+    ).json()["id"]
+    engineer_id = client.get("/engineers").json()[0]["id"]
+    task_one = client.post(
+        "/tasks",
+        json={
+            "project_id": project_id,
+            "assigned_engineer_id": engineer_id,
+            "title": "Release first",
+            "requirement_markdown": "First release candidate.",
+            "acceptance_criteria": "Ready first.",
+            "implementation_steps": "",
+            "status": "ready_to_deploy",
+        },
+    ).json()
+    task_two = client.post(
+        "/tasks",
+        json={
+            "project_id": project_id,
+            "assigned_engineer_id": engineer_id,
+            "title": "Release second",
+            "requirement_markdown": "Second release candidate.",
+            "acceptance_criteria": "Ready second.",
+            "implementation_steps": "",
+            "status": "ready_to_deploy",
+        },
+    ).json()
+    runtime_one = create_runtime(db_session, engineer_id)
+    runtime_two = create_runtime(db_session, engineer_id)
+
+    first_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_one.id})
+    assert first_poll.status_code == 200
+    assert first_poll.json()["task"]["id"] == task_one["id"]
+
+    second_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_two.id})
+    assert second_poll.status_code == 200
+    assert second_poll.json()["task_run"] is None
+
+    ready_complete = client.post(
+        f"/agent/task-runs/{task_one['task_runs'][0]['id']}/outcome",
+        json={
+            "outcome_type": "deployment_complete",
+            "summary": "PR is ready for merge.",
+            "branch_name": "codex/task-one",
+            "pr_url": "https://github.com/acme/release-queue/pull/1",
+            "deploy_url": None,
+            "blocked_reason": None,
+        },
+    )
+    assert ready_complete.status_code == 200
+
+    client.post(
+        f"/task-runs/{task_one['task_runs'][0]['id']}/approve",
+        json={"summary": "Merged and ready to deploy."},
+    )
+
+    deployment_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_one.id})
+    assert deployment_poll.status_code == 200
+    assert deployment_poll.json()["task"]["id"] == task_one["id"]
+    assert deployment_poll.json()["task"]["status"] == "deployed"
+
+    still_blocked = client.post("/agent/poll-next-task", json={"runtime_id": runtime_two.id})
+    assert still_blocked.status_code == 200
+    assert still_blocked.json()["task_run"] is None
+
+    deployment_complete = client.post(
+        f"/agent/task-runs/{deployment_poll.json()['task_run']['id']}/outcome",
+        json={
+            "outcome_type": "deployment_complete",
+            "summary": "Deployment completed.",
+            "branch_name": None,
+            "pr_url": "https://github.com/acme/release-queue/pull/1",
+            "deploy_url": "https://release.example.com",
+            "blocked_reason": None,
+        },
+    )
+    assert deployment_complete.status_code == 200
+
+    final_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_two.id})
+    assert final_poll.status_code == 200
+    assert final_poll.json()["task"]["id"] == task_two["id"]
+
+
+def test_manual_archive_from_deployment_stage_frees_release_queue(client, db_session):
+    project_id = client.post(
+        "/projects",
+        json={
+            "name": "Manual Archive Release Queue",
+            "repo_url": "https://github.com/acme/manual-archive",
+            "default_branch": "main",
+            "deploy_config": {"type": "frontend_static_s3"},
+            "deployment_instructions": "Deploy from main after release approval.",
+            "engineer_pool": [],
+        },
+    ).json()["id"]
+    engineer_id = client.get("/engineers").json()[0]["id"]
+    task_one = client.post(
+        "/tasks",
+        json={
+            "project_id": project_id,
+            "assigned_engineer_id": engineer_id,
+            "title": "Release first",
+            "requirement_markdown": "Deploy the first release candidate.",
+            "acceptance_criteria": "Deployment is completed or manually cleared from the queue.",
+            "implementation_steps": "",
+            "status": "ready_to_deploy",
+        },
+    ).json()
+    task_two = client.post(
+        "/tasks",
+        json={
+            "project_id": project_id,
+            "assigned_engineer_id": engineer_id,
+            "title": "Release second",
+            "requirement_markdown": "Deploy the second release candidate.",
+            "acceptance_criteria": "Deployment can start after the first task leaves the release queue.",
+            "implementation_steps": "",
+            "status": "ready_to_deploy",
+        },
+    ).json()
+    runtime_one = create_runtime(db_session, engineer_id)
+    runtime_two = create_runtime(db_session, engineer_id)
+    runtime_three = create_runtime(db_session, engineer_id)
+
+    first_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_one.id})
+    assert first_poll.status_code == 200
+    assert first_poll.json()["task"]["id"] == task_one["id"]
+
+    pr_ready_response = client.post(
+        f"/agent/task-runs/{task_one['task_runs'][0]['id']}/outcome",
+        json={
+            "outcome_type": "deployment_complete",
+            "summary": "PR is ready for merge and deployment handoff.",
+            "branch_name": "codex/task-32",
+            "pr_url": "https://github.com/acme/manual-archive/pull/32",
+            "deploy_url": None,
+            "blocked_reason": None,
+        },
+    )
+    assert pr_ready_response.status_code == 200
+
+    approval_response = client.post(
+        f"/task-runs/{task_one['task_runs'][0]['id']}/approve",
+        json={"summary": "Human merged the PR and started deployment."},
+    )
+    assert approval_response.status_code == 200
+
+    deployment_ready_task = client.get(f"/tasks/{task_one['id']}").json()
+    assert deployment_ready_task["status"] == "deployed"
+
+    blocked_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_two.id})
+    assert blocked_poll.status_code == 200
+    assert blocked_poll.json()["task"]["id"] == task_one["id"]
+    assert blocked_poll.json()["task"]["status"] == "deployed"
+
+    archive_response = client.patch(f"/tasks/{task_one['id']}", json={"status": "archived"})
+    assert archive_response.status_code == 200
+    assert archive_response.json()["status"] == "archived"
+
+    next_poll = client.post("/agent/poll-next-task", json={"runtime_id": runtime_three.id})
+    assert next_poll.status_code == 200
+    assert next_poll.json()["task"]["id"] == task_two["id"]
+
+
+def test_in_progress_outcome_ignores_pr_url_until_ready_to_deploy(client, db_session):
+    project_id = client.post(
+        "/projects",
+        json={
+            "name": "PR Guard",
+            "repo_url": "https://github.com/acme/pr-guard",
+            "default_branch": "main",
+            "deploy_config": {},
+            "engineer_pool": [],
+        },
+    ).json()["id"]
+    engineer_id = client.get("/engineers").json()[0]["id"]
+    task = client.post(
+        "/tasks",
+        json={
+            "project_id": project_id,
+            "assigned_engineer_id": engineer_id,
+            "title": "Finish feature branch without opening PR",
+            "requirement_markdown": "Implementation should not attach a PR before release prep.",
+            "acceptance_criteria": "Task moves to AI testing without a PR URL.",
+            "implementation_steps": "",
+            "status": "in_progress",
+        },
+    ).json()
+    runtime = create_runtime(db_session, engineer_id)
+    run_id = task["task_runs"][0]["id"]
+
+    poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
+    assert poll_response.status_code == 200
+    assert poll_response.json()["task_run"]["id"] == run_id
+
+    outcome_response = client.post(
+        f"/agent/task-runs/{run_id}/outcome",
+        json={
+            "outcome_type": "build_complete",
+            "summary": "Implementation is complete and branch is ready for AI testing.",
+            "branch_name": "codex/task-33",
+            "pr_url": "https://github.com/acme/pr-guard/pull/33",
+            "deploy_url": None,
+            "blocked_reason": None,
+        },
+    )
+    assert outcome_response.status_code == 200
+
+    updated_task = client.get(f"/tasks/{task['id']}").json()
+    assert updated_task["status"] == "ai_testing"
+    assert updated_task["branch_name"] == "codex/task-33"
+    assert updated_task["pr_url"] is None
 
 
 def test_settings_crud(client):
@@ -241,6 +482,7 @@ def test_engineer_launch_stop_and_health_ping(client):
         def launch_engineer(
             self,
             engineer_record,
+            runtime_record,
             codex_auth_json,
             github_token,
             aws_access_key_id,
@@ -252,9 +494,9 @@ def test_engineer_launch_stop_and_health_ping(client):
             assert aws_access_key_id == ""
             assert aws_secret_access_key == ""
             assert aws_region == ""
-            return (f"devboss-engineer-{engineer_record.id}", "container-123")
+            return (f"devboss-engineer-{engineer_record.id}-{runtime_record.id}", "container-123")
 
-        def stop_engineer(self, engineer_record):
+        def stop_engineer_runtime(self, runtime_record):
             return None
 
     original_runtime_manager = main_module.runtime_manager
@@ -264,12 +506,13 @@ def test_engineer_launch_stop_and_health_ping(client):
         assert launch_response.status_code == 200
         launched = launch_response.json()
         assert launched["runtime_status"] == "starting"
-        assert launched["runtime_container_name"] == f"devboss-engineer-{engineer['id']}"
+        runtime_id = launched["runtimes"][0]["id"]
+        assert launched["runtime_container_name"] == f"devboss-engineer-{engineer['id']}-{runtime_id}"
 
         heartbeat_response = client.post(
-            f"/engineers/{engineer['id']}/heartbeat",
+            f"/engineer-runtimes/{runtime_id}/heartbeat",
             json={
-                "container_name": f"devboss-engineer-{engineer['id']}",
+                "container_name": f"devboss-engineer-{engineer['id']}-{runtime_id}",
                 "container_id": "container-123",
                 "status_message": "Runtime heartbeat received from engineer container.",
             },
@@ -277,13 +520,13 @@ def test_engineer_launch_stop_and_health_ping(client):
         assert heartbeat_response.status_code == 200
         heartbeat = heartbeat_response.json()
         assert heartbeat["runtime_status"] == "healthy"
-        assert heartbeat["runtime_last_heartbeat_at"] is not None
+        assert heartbeat["last_heartbeat_at"] is not None
 
-        stop_response = client.post(f"/engineers/{engineer['id']}/stop")
+        stop_response = client.post(f"/engineer-runtimes/{runtime_id}/stop")
         assert stop_response.status_code == 200
         stopped = stop_response.json()
         assert stopped["runtime_status"] == "stopped"
-        assert stopped["runtime_container_name"] is None
+        assert stopped["container_name"] is None
     finally:
         main_module.runtime_manager = original_runtime_manager
 
@@ -311,15 +554,16 @@ def test_delete_engineer_blocks_when_running_and_when_referenced(client):
         def launch_engineer(
             self,
             engineer_record,
+            runtime_record,
             codex_auth_json,
             github_token,
             aws_access_key_id,
             aws_secret_access_key,
             aws_region,
         ):
-            return (f"devboss-engineer-{engineer_record.id}", "container-123")
+            return (f"devboss-engineer-{engineer_record.id}-{runtime_record.id}", "container-123")
 
-        def stop_engineer(self, engineer_record):
+        def stop_engineer_runtime(self, runtime_record):
             return None
 
     original_runtime_manager = main_module.runtime_manager
@@ -388,7 +632,7 @@ def test_delete_engineer_blocks_when_running_and_when_referenced(client):
         main_module.runtime_manager = original_runtime_manager
 
 
-def test_human_reply_requeues_waiting_task_run(client):
+def test_human_reply_requeues_waiting_task_run(client, db_session):
     project_id = client.post(
         "/projects",
         json={
@@ -413,8 +657,9 @@ def test_human_reply_requeues_waiting_task_run(client):
         },
     ).json()
     task_run_id = task["task_runs"][0]["id"]
+    runtime = create_runtime(db_session, engineer_id)
 
-    poll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_response.status_code == 200
     outcome_response = client.post(
         f"/agent/task-runs/{task_run_id}/outcome",
@@ -446,12 +691,12 @@ def test_human_reply_requeues_waiting_task_run(client):
     latest_run = task_response.json()["task_runs"][-1]
     assert latest_run["status"] == "pending"
 
-    repoll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    repoll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert repoll_response.status_code == 200
     assert repoll_response.json()["task_run"]["id"] == task_run_id
 
 
-def test_retry_delete_comment_and_delete_task(client):
+def test_retry_delete_comment_and_delete_task(client, db_session):
     project_id = client.post(
         "/projects",
         json={
@@ -476,8 +721,9 @@ def test_retry_delete_comment_and_delete_task(client):
         },
     ).json()
     task_run_id = task["task_runs"][0]["id"]
+    runtime = create_runtime(db_session, engineer_id)
 
-    poll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_response.status_code == 200
     assert poll_response.json()["task_run"]["id"] == task_run_id
 
@@ -527,7 +773,7 @@ def test_retry_delete_comment_and_delete_task(client):
     assert missing_task_response.status_code == 404
 
 
-def test_ai_testing_failure_loops_back_to_in_progress_until_human_pause(client):
+def test_ai_testing_failure_loops_back_to_in_progress_until_human_pause(client, db_session):
     project_id = client.post(
         "/projects",
         json={
@@ -551,10 +797,11 @@ def test_ai_testing_failure_loops_back_to_in_progress_until_human_pause(client):
             "status": "ai_testing",
         },
     ).json()
+    runtime = create_runtime(db_session, engineer_id)
 
     for expected_loop in range(1, 4):
         current_run_id = task["task_runs"][-1]["id"]
-        poll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+        poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
         assert poll_response.status_code == 200
         assert poll_response.json()["task_run"]["id"] == current_run_id
 
@@ -595,7 +842,7 @@ def test_ai_testing_failure_loops_back_to_in_progress_until_human_pause(client):
         assert task["status"] == "ai_testing"
 
     final_testing_run_id = task["task_runs"][-1]["id"]
-    poll_response = client.post("/agent/poll-next-task", json={"engineer_id": engineer_id})
+    poll_response = client.post("/agent/poll-next-task", json={"runtime_id": runtime.id})
     assert poll_response.status_code == 200
     assert poll_response.json()["task_run"]["id"] == final_testing_run_id
 

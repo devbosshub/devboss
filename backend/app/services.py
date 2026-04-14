@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.enums import ArtifactKind, CommentAuthorType, EngineerRuntimeStatus, OutcomeType, RunPhase, RunStatus, TaskStatus
-from app.models import ConfigSetting, Engineer, EvidenceArtifact, Project, Task, TaskComment, TaskRun
+from app.models import ConfigSetting, Engineer, EngineerRuntime, EvidenceArtifact, Project, Task, TaskComment, TaskRun
 from app.schemas import AgentOutcome, TaskCommentCreate, TaskCreate, TaskUpdate
 from app.storage import LocalArtifactStorage
 from app.workflow import (
@@ -24,6 +24,9 @@ def utcnow() -> datetime:
 
 
 MAX_TESTING_REWORK_LOOPS = 3
+RELEASE_TASK_STATUSES = {TaskStatus.READY_TO_DEPLOY, TaskStatus.DEPLOYED}
+ACTIVE_RELEASE_RUN_STATUSES = {RunStatus.PENDING, RunStatus.CLAIMED, RunStatus.RUNNING, RunStatus.WAITING_HUMAN}
+PR_URL_ALLOWED_STATUSES = {TaskStatus.READY_TO_DEPLOY, TaskStatus.DEPLOYED}
 
 
 PROMPT_DIRECTORY = Path(__file__).resolve().parent / "prompts"
@@ -60,10 +63,17 @@ def delete_project(db: Session, project_id: int) -> None:
 
 
 def get_engineer_or_404(db: Session, engineer_id: int) -> Engineer:
-    engineer = db.get(Engineer, engineer_id)
+    engineer = db.scalar(select(Engineer).options(selectinload(Engineer.runtimes)).where(Engineer.id == engineer_id))
     if not engineer:
         raise HTTPException(status_code=404, detail="Engineer not found")
     return engineer
+
+
+def get_engineer_runtime_or_404(db: Session, runtime_id: int) -> EngineerRuntime:
+    runtime = db.get(EngineerRuntime, runtime_id)
+    if not runtime:
+        raise HTTPException(status_code=404, detail="Engineer runtime not found")
+    return runtime
 
 
 def delete_engineer(db: Session, engineer_id: int) -> Engineer:
@@ -81,18 +91,21 @@ def delete_engineer(db: Session, engineer_id: int) -> Engineer:
     return engineer
 
 
-def refresh_engineer_runtime_health(db: Session, engineer: Engineer, heartbeat_timeout_seconds: int) -> Engineer:
-    is_running_like = engineer.runtime_status in {
+def _refresh_runtime_health_state(runtime: EngineerRuntime, heartbeat_timeout_seconds: int) -> EngineerRuntime:
+    is_running_like = runtime.runtime_status in {
         EngineerRuntimeStatus.STARTING,
         EngineerRuntimeStatus.HEALTHY,
         EngineerRuntimeStatus.HEARTBEAT_MISSING,
     }
     if not is_running_like:
-        return engineer
+        return runtime
 
-    reference_time = engineer.runtime_last_heartbeat_at or engineer.runtime_started_at
+    if runtime.runtime_status == EngineerRuntimeStatus.STARTING and runtime.last_heartbeat_at is None:
+        return runtime
+
+    reference_time = runtime.last_heartbeat_at or runtime.started_at
     if reference_time is None:
-        return engineer
+        return runtime
     if reference_time.tzinfo is None:
         reference_time = reference_time.replace(tzinfo=timezone.utc)
 
@@ -102,22 +115,76 @@ def refresh_engineer_runtime_health(db: Session, engineer: Engineer, heartbeat_t
         if heartbeat_age <= heartbeat_timeout_seconds
         else EngineerRuntimeStatus.HEARTBEAT_MISSING
     )
-    if engineer.runtime_status != next_status:
-        engineer.runtime_status = next_status
-        engineer.runtime_status_message = (
+    if runtime.runtime_status != next_status:
+        runtime.runtime_status = next_status
+        runtime.status_message = (
             "Runtime heartbeat is current."
             if next_status == EngineerRuntimeStatus.HEALTHY
             else "Heartbeat missing. Runtime may be down."
         )
-        engineer.updated_at = utcnow()
-        db.add(engineer)
-        db.commit()
-        db.refresh(engineer)
+        runtime.updated_at = utcnow()
+    return runtime
+
+
+def _apply_engineer_runtime_summary(engineer: Engineer) -> Engineer:
+    runtimes = engineer.runtimes or []
+    engineer.runtime_count = len(runtimes)
+    engineer.healthy_runtime_count = len([runtime for runtime in runtimes if runtime.runtime_status == EngineerRuntimeStatus.HEALTHY])
+    engineer.busy_runtime_count = len([runtime for runtime in runtimes if runtime.current_task_run_id is not None])
+
+    if not runtimes:
+        engineer.runtime_status = EngineerRuntimeStatus.STOPPED
+        engineer.runtime_container_name = None
+        engineer.runtime_container_id = None
+        engineer.runtime_status_message = "No runtime instances are running."
+        engineer.runtime_started_at = None
+        engineer.runtime_last_heartbeat_at = None
+        return engineer
+
+    latest_runtime = max(runtimes, key=lambda runtime: runtime.created_at)
+    engineer.runtime_container_name = latest_runtime.container_name
+    engineer.runtime_container_id = latest_runtime.container_id
+    engineer.runtime_started_at = latest_runtime.started_at
+    engineer.runtime_last_heartbeat_at = latest_runtime.last_heartbeat_at
+
+    if engineer.healthy_runtime_count:
+        engineer.runtime_status = EngineerRuntimeStatus.HEALTHY
+    elif any(runtime.runtime_status == EngineerRuntimeStatus.STARTING for runtime in runtimes):
+        engineer.runtime_status = EngineerRuntimeStatus.STARTING
+    elif any(runtime.runtime_status == EngineerRuntimeStatus.HEARTBEAT_MISSING for runtime in runtimes):
+        engineer.runtime_status = EngineerRuntimeStatus.HEARTBEAT_MISSING
+    elif any(runtime.runtime_status == EngineerRuntimeStatus.LAUNCH_FAILED for runtime in runtimes):
+        engineer.runtime_status = EngineerRuntimeStatus.LAUNCH_FAILED
+    else:
+        engineer.runtime_status = EngineerRuntimeStatus.STOPPED
+
+    status_parts = []
+    if engineer.runtime_count:
+        status_parts.append(f"{engineer.runtime_count} runtime{'s' if engineer.runtime_count != 1 else ''}")
+    if engineer.healthy_runtime_count:
+        status_parts.append(f"{engineer.healthy_runtime_count} healthy")
+    if engineer.busy_runtime_count:
+        status_parts.append(f"{engineer.busy_runtime_count} busy")
+    engineer.runtime_status_message = ", ".join(status_parts) if status_parts else latest_runtime.status_message
     return engineer
 
 
+def refresh_engineer_runtime_health(db: Session, engineer: Engineer, heartbeat_timeout_seconds: int) -> Engineer:
+    has_changes = False
+    for runtime in engineer.runtimes:
+        before = runtime.runtime_status
+        _refresh_runtime_health_state(runtime, heartbeat_timeout_seconds)
+        if runtime.runtime_status != before or db.is_modified(runtime):
+            db.add(runtime)
+            has_changes = True
+    if has_changes:
+        db.commit()
+        db.refresh(engineer)
+    return _apply_engineer_runtime_summary(engineer)
+
+
 def list_engineers_with_runtime_health(db: Session, heartbeat_timeout_seconds: int) -> list[Engineer]:
-    engineers = list(db.scalars(select(Engineer).order_by(Engineer.created_at.asc())))
+    engineers = list(db.scalars(select(Engineer).options(selectinload(Engineer.runtimes)).order_by(Engineer.created_at.asc())))
     return [refresh_engineer_runtime_health(db, engineer, heartbeat_timeout_seconds) for engineer in engineers]
 
 
@@ -175,11 +242,38 @@ def list_attention_tasks(db: Session) -> list[Task]:
     ]
 
 
+def task_is_release_stage(task: Task) -> bool:
+    return task.status in RELEASE_TASK_STATUSES
+
+
+def release_queue_head_task_id(db: Session, project_id: int) -> int | None:
+    queued_release_tasks = list(
+        db.scalars(
+            select(Task)
+            .where(Task.project_id == project_id, Task.status.in_(list(RELEASE_TASK_STATUSES)))
+            .order_by(Task.created_at.asc())
+        )
+    )
+    if not queued_release_tasks:
+        return None
+    ordered = sorted(
+        queued_release_tasks,
+        key=lambda item: (
+            item.release_queue_entered_at or item.updated_at or item.created_at,
+            item.created_at,
+            item.id,
+        ),
+    )
+    return ordered[0].id
+
+
 def create_task(db: Session, payload: TaskCreate) -> Task:
     get_project_or_404(db, payload.project_id)
     if payload.assigned_engineer_id is not None:
         get_engineer_or_404(db, payload.assigned_engineer_id)
     task = Task(**payload.model_dump())
+    if task.status in RELEASE_TASK_STATUSES and task.release_queue_entered_at is None:
+        task.release_queue_entered_at = utcnow()
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -194,6 +288,8 @@ def update_task(db: Session, task_id: int, payload: TaskUpdate) -> Task:
         if not can_transition(task.status, target_status):
             raise HTTPException(status_code=400, detail=f"Invalid status transition from {task.status} to {target_status}")
         task.status = target_status
+        if target_status == TaskStatus.READY_TO_DEPLOY and task.release_queue_entered_at is None:
+            task.release_queue_entered_at = utcnow()
         maybe_create_task_run(db, task)
         updates.pop("status")
     for field, value in updates.items():
@@ -214,6 +310,9 @@ def add_comment(db: Session, task_id: int, payload: TaskCommentCreate) -> TaskCo
         if latest_run.status == RunStatus.WAITING_HUMAN:
             latest_run.status = RunStatus.PENDING
             latest_run.summary = "Human replied, re-queued for engineer execution."
+            latest_run.claimed_by_runtime_id = None
+            latest_run.claimed_at = None
+            latest_run.started_at = None
             latest_run.heartbeat_at = utcnow()
             latest_run.updated_at = utcnow()
             db.add(latest_run)
@@ -257,6 +356,8 @@ def approve_task_run(db: Session, task_run_id: int, summary: str | None = None) 
     if not can_transition(task.status, next_status):
         raise HTTPException(status_code=400, detail="Invalid approval transition")
     task.status = next_status
+    if next_status == TaskStatus.DEPLOYED and task.release_queue_entered_at is None:
+        task.release_queue_entered_at = utcnow()
     task.blocked_reason = None
     task.updated_at = utcnow()
     if summary:
@@ -314,6 +415,7 @@ def retry_task(db: Session, task_id: int) -> Task:
         open_run.summary = "Re-queued by human."
         open_run.outcome_type = None
         open_run.outcome_payload_json = None
+        open_run.claimed_by_runtime_id = None
         open_run.claimed_at = None
         open_run.started_at = None
         open_run.completed_at = None
@@ -330,13 +432,23 @@ def retry_task(db: Session, task_id: int) -> Task:
     return get_task_or_404(db, task.id)
 
 
-def poll_next_task(db: Session, engineer_id: int) -> tuple[TaskRun | None, Task | None]:
-    get_engineer_or_404(db, engineer_id)
+def poll_next_task(db: Session, runtime_id: int) -> tuple[TaskRun | None, Task | None, EngineerRuntime | None]:
+    runtime = get_engineer_runtime_or_404(db, runtime_id)
+    engineer = get_engineer_or_404(db, runtime.engineer_id)
+    if runtime.current_task_run_id is not None:
+        active_run = db.get(TaskRun, runtime.current_task_run_id)
+        if active_run and active_run.status in {RunStatus.CLAIMED, RunStatus.RUNNING}:
+            return None, None, runtime
+        runtime.current_task_run_id = None
+        db.add(runtime)
+        db.commit()
+
     stmt = (
         select(TaskRun)
+        .options(selectinload(TaskRun.task))
         .join(Task)
         .where(
-            TaskRun.engineer_id == engineer_id,
+            TaskRun.engineer_id == engineer.id,
             TaskRun.status == RunStatus.PENDING,
             Task.status.in_(
                 [
@@ -350,14 +462,31 @@ def poll_next_task(db: Session, engineer_id: int) -> tuple[TaskRun | None, Task 
         )
         .order_by(TaskRun.created_at.asc())
     )
-    task_run = db.scalar(stmt)
-    if not task_run:
-        return None, None
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    task_runs = list(db.scalars(stmt))
+    if not task_runs:
+        return None, None, runtime
+    task_run = None
+    for candidate in task_runs:
+        candidate_task = candidate.task or get_task_or_404(db, candidate.task_id)
+        if task_is_release_stage(candidate_task):
+            release_head_task_id = release_queue_head_task_id(db, candidate_task.project_id)
+            if release_head_task_id != candidate_task.id:
+                continue
+        task_run = candidate
+        break
+    if task_run is None:
+        return None, None, runtime
     task_run.status = RunStatus.CLAIMED
+    task_run.claimed_by_runtime_id = runtime.id
     task_run.claimed_at = utcnow()
     task_run.started_at = utcnow()
     task_run.heartbeat_at = utcnow()
+    runtime.current_task_run_id = task_run.id
+    runtime.updated_at = utcnow()
     db.add(task_run)
+    db.add(runtime)
     db.commit()
     task = get_task_or_404(db, task_run.task_id)
     if task.blocked_reason:
@@ -366,7 +495,7 @@ def poll_next_task(db: Session, engineer_id: int) -> tuple[TaskRun | None, Task 
         db.add(task)
         db.commit()
         task = get_task_or_404(db, task_run.task_id)
-    return task_run, task
+    return task_run, task, runtime
 
 
 def update_heartbeat(db: Session, task_run_id: int, status_value: RunStatus | None, summary: str | None) -> TaskRun:
@@ -374,6 +503,11 @@ def update_heartbeat(db: Session, task_run_id: int, status_value: RunStatus | No
     if not task_run:
         raise HTTPException(status_code=404, detail="Task run not found")
     task_run.heartbeat_at = utcnow()
+    if task_run.claimed_by_runtime_id is not None:
+        runtime = db.get(EngineerRuntime, task_run.claimed_by_runtime_id)
+        if runtime:
+            runtime.last_heartbeat_at = utcnow()
+            db.add(runtime)
     if status_value is not None:
         task_run.status = status_value
     if summary:
@@ -455,10 +589,16 @@ def apply_agent_outcome(db: Session, task_run_id: int, payload: AgentOutcome) ->
     task_run.summary = payload.summary
     task_run.outcome_payload_json = payload.model_dump(mode="json")
     task_run.heartbeat_at = utcnow()
+    if task_run.claimed_by_runtime_id is not None:
+        runtime = db.get(EngineerRuntime, task_run.claimed_by_runtime_id)
+        if runtime:
+            runtime.current_task_run_id = None
+            runtime.last_heartbeat_at = utcnow()
+            db.add(runtime)
 
     if payload.branch_name and task.status != TaskStatus.AI_GROOMING:
         task.branch_name = payload.branch_name
-    if payload.pr_url:
+    if payload.pr_url and task.status in PR_URL_ALLOWED_STATUSES:
         task.pr_url = payload.pr_url
     if payload.deploy_url:
         task.deploy_url = payload.deploy_url
@@ -719,51 +859,85 @@ def delete_config_setting(db: Session, setting_id: int) -> None:
     db.commit()
 
 
-def mark_engineer_runtime_launching(db: Session, engineer: Engineer, container_name: str, container_id: str) -> Engineer:
-    engineer.runtime_status = EngineerRuntimeStatus.STARTING
-    engineer.runtime_container_name = container_name
-    engineer.runtime_container_id = container_id
-    engineer.runtime_status_message = "Container launched. Waiting for heartbeat."
-    engineer.runtime_started_at = utcnow()
-    engineer.runtime_last_heartbeat_at = None
-    engineer.updated_at = utcnow()
-    db.add(engineer)
+def create_engineer_runtime(db: Session, engineer: Engineer) -> EngineerRuntime:
+    runtime = EngineerRuntime(
+        engineer_id=engineer.id,
+        runtime_status=EngineerRuntimeStatus.STARTING,
+        status_message="Preparing runtime launch.",
+    )
+    db.add(runtime)
     db.commit()
-    db.refresh(engineer)
-    return engineer
+    db.refresh(runtime)
+    return runtime
 
 
-def mark_engineer_runtime_stopped(db: Session, engineer: Engineer, message: str = "Runtime stopped.") -> Engineer:
-    engineer.runtime_status = EngineerRuntimeStatus.STOPPED
-    engineer.runtime_status_message = message
-    engineer.runtime_container_name = None
-    engineer.runtime_container_id = None
-    engineer.runtime_started_at = None
-    engineer.runtime_last_heartbeat_at = None
-    engineer.updated_at = utcnow()
-    db.add(engineer)
-    db.commit()
-    db.refresh(engineer)
-    return engineer
-
-
-def record_engineer_heartbeat(
+def mark_engineer_runtime_launching(
     db: Session,
-    engineer_id: int,
+    runtime: EngineerRuntime,
+    container_name: str,
+    container_id: str,
+) -> EngineerRuntime:
+    runtime.runtime_status = EngineerRuntimeStatus.STARTING
+    runtime.container_name = container_name
+    runtime.container_id = container_id
+    runtime.status_message = "Container launched. Waiting for heartbeat."
+    runtime.started_at = utcnow()
+    runtime.last_heartbeat_at = None
+    runtime.updated_at = utcnow()
+    db.add(runtime)
+    db.commit()
+    db.refresh(runtime)
+    return runtime
+
+
+def release_runtime_task_claim(db: Session, runtime: EngineerRuntime, message: str) -> EngineerRuntime:
+    if runtime.current_task_run_id is not None:
+        task_run = db.get(TaskRun, runtime.current_task_run_id)
+        if task_run and task_run.status in {RunStatus.CLAIMED, RunStatus.RUNNING}:
+            task_run.status = RunStatus.PENDING
+            task_run.summary = message
+            task_run.claimed_by_runtime_id = None
+            task_run.claimed_at = None
+            task_run.started_at = None
+            task_run.heartbeat_at = utcnow()
+            task_run.updated_at = utcnow()
+            db.add(task_run)
+    runtime.current_task_run_id = None
+    return runtime
+
+
+def mark_engineer_runtime_stopped(db: Session, runtime: EngineerRuntime, message: str = "Runtime stopped.") -> EngineerRuntime:
+    release_runtime_task_claim(db, runtime, "Runtime stopped before task completion. Re-queued for the next available runtime.")
+    runtime.runtime_status = EngineerRuntimeStatus.STOPPED
+    runtime.status_message = message
+    runtime.container_name = None
+    runtime.container_id = None
+    runtime.started_at = None
+    runtime.last_heartbeat_at = None
+    runtime.updated_at = utcnow()
+    db.add(runtime)
+    db.commit()
+    db.refresh(runtime)
+    return runtime
+
+
+def record_engineer_runtime_heartbeat(
+    db: Session,
+    runtime_id: int,
     container_name: str,
     container_id: str | None,
     status_message: str | None,
-) -> Engineer:
-    engineer = get_engineer_or_404(db, engineer_id)
-    engineer.runtime_status = EngineerRuntimeStatus.HEALTHY
-    engineer.runtime_container_name = container_name
-    engineer.runtime_container_id = container_id or engineer.runtime_container_id
-    engineer.runtime_status_message = status_message or "Runtime heartbeat received."
-    if engineer.runtime_started_at is None:
-        engineer.runtime_started_at = utcnow()
-    engineer.runtime_last_heartbeat_at = utcnow()
-    engineer.updated_at = utcnow()
-    db.add(engineer)
+) -> EngineerRuntime:
+    runtime = get_engineer_runtime_or_404(db, runtime_id)
+    runtime.runtime_status = EngineerRuntimeStatus.HEALTHY
+    runtime.container_name = container_name
+    runtime.container_id = container_id or runtime.container_id
+    runtime.status_message = status_message or "Runtime heartbeat received."
+    if runtime.started_at is None:
+        runtime.started_at = utcnow()
+    runtime.last_heartbeat_at = utcnow()
+    runtime.updated_at = utcnow()
+    db.add(runtime)
     db.commit()
-    db.refresh(engineer)
-    return engineer
+    db.refresh(runtime)
+    return runtime

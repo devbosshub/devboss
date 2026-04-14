@@ -737,6 +737,28 @@ textarea {
   align-items: center;
 }
 
+.table-runtime-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.table-runtime-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.table-runtime-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
 .summary-row {
   display: flex;
   justify-content: space-between;
@@ -798,6 +820,22 @@ textarea {
   flex-direction: column;
   gap: 10px;
   min-height: 0;
+}
+
+.lane-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.lane-footnote {
+  font-size: 0.82rem;
+  color: var(--text-soft);
+}
+
+.lane-load-more {
+  align-self: flex-start;
 }
 
 .task-card {

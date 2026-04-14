@@ -74,6 +74,22 @@ class EngineerUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class EngineerRuntimeRead(BaseModel):
+    id: int
+    engineer_id: int
+    runtime_status: EngineerRuntimeStatus
+    container_name: str | None = None
+    container_id: str | None = None
+    status_message: str | None = None
+    started_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    current_task_run_id: int | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class EngineerRead(EngineerBase):
     id: int
     runtime_status: EngineerRuntimeStatus
@@ -82,6 +98,10 @@ class EngineerRead(EngineerBase):
     runtime_status_message: str | None = None
     runtime_started_at: datetime | None = None
     runtime_last_heartbeat_at: datetime | None = None
+    runtime_count: int = 0
+    healthy_runtime_count: int = 0
+    busy_runtime_count: int = 0
+    runtimes: list[EngineerRuntimeRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -152,6 +172,7 @@ class TaskRunRead(BaseModel):
     id: int
     task_id: int
     engineer_id: int
+    claimed_by_runtime_id: int | None = None
     phase: RunPhase
     status: RunStatus
     outcome_type: OutcomeType | None = None
@@ -175,6 +196,7 @@ class TaskRead(TaskBase):
     pr_url: str | None = None
     deploy_url: str | None = None
     blocked_reason: str | None = None
+    release_queue_entered_at: datetime | None = None
     testing_rework_count: int = 0
     created_at: datetime
     updated_at: datetime
@@ -199,7 +221,7 @@ class TaskRunApprovalRequest(BaseModel):
 
 
 class AgentPollRequest(BaseModel):
-    engineer_id: int
+    runtime_id: int
 
 
 class AgentPollResponse(BaseModel):
@@ -208,6 +230,7 @@ class AgentPollResponse(BaseModel):
     project: ProjectRead | None = None
     engineer: EngineerRead | None = None
     task_bundle: dict | None = None
+    runtime: EngineerRuntimeRead | None = None
 
 
 class AgentHeartbeat(BaseModel):

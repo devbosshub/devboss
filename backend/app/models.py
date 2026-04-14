@@ -63,6 +63,34 @@ class Engineer(Base):
 
     tasks: Mapped[list["Task"]] = relationship(back_populates="assigned_engineer")
     task_runs: Mapped[list["TaskRun"]] = relationship(back_populates="engineer")
+    runtimes: Mapped[list["EngineerRuntime"]] = relationship(
+        back_populates="engineer",
+        cascade="all, delete-orphan",
+        order_by="EngineerRuntime.created_at",
+    )
+
+
+class EngineerRuntime(Base):
+    __tablename__ = "engineer_runtimes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    engineer_id: Mapped[int] = mapped_column(ForeignKey("engineers.id"), index=True)
+    runtime_status: Mapped[EngineerRuntimeStatus] = mapped_column(String(64), default=EngineerRuntimeStatus.STOPPED, index=True)
+    container_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    container_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_task_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("task_runs.id", use_alter=True, name="fk_engineer_runtimes_current_task_run_id"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    engineer: Mapped["Engineer"] = relationship(back_populates="runtimes")
+    current_task_run: Mapped["TaskRun | None"] = relationship(foreign_keys=[current_task_run_id])
 
 
 class Task(Base):
@@ -80,6 +108,7 @@ class Task(Base):
     pr_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     deploy_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    release_queue_entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     testing_rework_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -119,6 +148,11 @@ class TaskRun(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
     engineer_id: Mapped[int] = mapped_column(ForeignKey("engineers.id"), index=True)
+    claimed_by_runtime_id: Mapped[int | None] = mapped_column(
+        ForeignKey("engineer_runtimes.id", use_alter=True, name="fk_task_runs_claimed_by_runtime_id"),
+        nullable=True,
+        index=True,
+    )
     phase: Mapped[RunPhase] = mapped_column(Enum(RunPhase))
     status: Mapped[RunStatus] = mapped_column(Enum(RunStatus), default=RunStatus.PENDING, index=True)
     outcome_type: Mapped[OutcomeType | None] = mapped_column(Enum(OutcomeType), nullable=True)
@@ -134,6 +168,7 @@ class TaskRun(Base):
 
     task: Mapped[Task] = relationship(back_populates="task_runs")
     engineer: Mapped[Engineer] = relationship(back_populates="task_runs")
+    claimed_by_runtime: Mapped["EngineerRuntime | None"] = relationship(foreign_keys=[claimed_by_runtime_id])
 
 
 class EvidenceArtifact(Base):

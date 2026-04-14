@@ -25,13 +25,14 @@ export function TaskActions({
   const advanceToGrooming = task.status === "draft";
   const advanceToReadyToDeploy = task.status === "human_testing";
   const canStartDeployment = task.status === "ready_to_deploy" && Boolean(task.pr_url);
+  const canArchiveTask = task.status === "ready_to_deploy" || task.status === "deployed";
   const canApproveRun =
     latestRun !== null &&
     (task.status === "ai_grooming" ||
       task.status === "ready_for_build" ||
       canStartDeployment);
 
-  if (!advanceToGrooming && !advanceToReadyToDeploy && !canApproveRun) {
+  if (!advanceToGrooming && !advanceToReadyToDeploy && !canApproveRun && !canArchiveTask) {
     return null;
   }
 
@@ -73,7 +74,7 @@ export function TaskActions({
           }
           type="button"
         >
-          Mark ready to deploy
+          Queue for release
         </button>
       ) : null}
 
@@ -101,6 +102,29 @@ export function TaskActions({
             : task.status === "ready_for_build"
               ? "Approve build start"
               : "Approve grooming handoff"}
+        </button>
+      ) : null}
+
+      {canArchiveTask ? (
+        <button
+          className={actionClassName}
+          disabled={isPending}
+          onClick={() => {
+            const confirmed = window.confirm("Archive this task and remove it from the release queue?");
+            if (!confirmed) {
+              return;
+            }
+
+            startTransition(async () => {
+              await api.updateTask(task.id, { status: "archived" });
+              await onRefresh?.();
+              onAfterAction?.();
+              router.refresh();
+            });
+          }}
+          type="button"
+        >
+          Archive task
         </button>
       ) : null}
     </div>

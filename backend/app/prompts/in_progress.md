@@ -17,6 +17,7 @@ Implement the task end to end inside the repository on a new git branch and push
 - Do not claim success if the implementation is incomplete or unverified.
 - Do not silently skip important validation if it is available.
 - Do not switch back to the default branch for implementation work.
+- Do not create, link, or mention a pull request in `pr_url` during this stage. Pull request creation belongs only to the `ready_to_deploy` stage.
 
 ## How To Decide The Outcome
 - Emit `build_complete` only when the implementation is complete enough to move into AI testing and the task branch is ready to be pushed for the next stage to reuse.

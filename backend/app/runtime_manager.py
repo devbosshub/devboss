@@ -7,7 +7,7 @@ from docker.errors import APIError, BuildError, DockerException, NotFound
 from fastapi import HTTPException
 
 from app.config import Settings
-from app.models import Engineer
+from app.models import Engineer, EngineerRuntime
 
 
 class DockerRuntimeManager:
@@ -33,6 +33,7 @@ class DockerRuntimeManager:
     def launch_engineer(
         self,
         engineer: Engineer,
+        runtime: EngineerRuntime,
         codex_auth_json: str,
         github_token: str,
         aws_access_key_id: str,
@@ -40,7 +41,7 @@ class DockerRuntimeManager:
         aws_region: str,
     ) -> tuple[str, str]:
         client = self._client()
-        container_name = f"devboss-engineer-{engineer.id}"
+        container_name = f"devboss-engineer-{engineer.id}-{runtime.id}"
 
         try:
             existing = client.containers.get(container_name)
@@ -57,6 +58,7 @@ class DockerRuntimeManager:
         environment = {
             "DEVBOSS_API_BASE_URL": self.settings.runtime_api_base_url,
             "DEVBOSS_ENGINEER_ID": str(engineer.id),
+            "DEVBOSS_RUNTIME_ID": str(runtime.id),
             "DEVBOSS_HEARTBEAT_INTERVAL_SECONDS": "60",
             "DEVBOSS_CONTAINER_NAME": container_name,
             "DEVBOSS_HEARTBEAT_ONLY": "false",
@@ -80,6 +82,7 @@ class DockerRuntimeManager:
                 environment=environment,
                 labels={
                     "devboss.engineer_id": str(engineer.id),
+                    "devboss.runtime_id": str(runtime.id),
                     "devboss.managed": "true",
                 },
             )
@@ -88,8 +91,8 @@ class DockerRuntimeManager:
 
         return container.name, container.id
 
-    def stop_engineer(self, engineer: Engineer) -> None:
-        container_name = engineer.runtime_container_name or f"devboss-engineer-{engineer.id}"
+    def stop_engineer_runtime(self, runtime: EngineerRuntime) -> None:
+        container_name = runtime.container_name or f"devboss-engineer-{runtime.engineer_id}-{runtime.id}"
         client = self._client()
         try:
             container = client.containers.get(container_name)

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import Base, engine, get_db
 from app.enums import ArtifactKind, EngineerRuntimeStatus, RunStatus, TaskStatus
-from app.models import ConfigSetting, Engineer, Project, Task, TaskRun
+from app.models import ConfigSetting, Engineer, EngineerRuntime, Project, Task, TaskRun
 from app.schemas import (
     AgentHeartbeat,
     AgentLog,
@@ -25,6 +25,7 @@ from app.schemas import (
     ConfigSettingUpdate,
     EngineerCreate,
     EngineerRead,
+    EngineerRuntimeRead,
     EngineerUpdate,
     ProjectCreate,
     ProjectRead,
@@ -44,6 +45,7 @@ from app.services import (
     add_comment,
     apply_agent_outcome,
     approve_task_run,
+    create_engineer_runtime,
     delete_comment,
     delete_engineer,
     delete_project,
@@ -54,6 +56,7 @@ from app.services import (
     create_task,
     get_config_setting_by_key,
     get_engineer_or_404,
+    get_engineer_runtime_or_404,
     get_optional_config_setting_by_key,
     get_project_or_404,
     get_task_or_404,
@@ -65,7 +68,7 @@ from app.services import (
     mark_engineer_runtime_stopped,
     maybe_create_task_run,
     poll_next_task,
-    record_engineer_heartbeat,
+    record_engineer_runtime_heartbeat,
     refresh_engineer_runtime_health,
     reject_task_run,
     retry_task,
@@ -88,6 +91,12 @@ def ensure_runtime_schema() -> None:
     task_columns = {column["name"] for column in inspector.get_columns("tasks")}
     task_run_columns = {column["name"] for column in inspector.get_columns("task_runs")}
     project_columns = {column["name"] for column in inspector.get_columns("projects")}
+    runtime_tables = set(inspector.get_table_names())
+    runtime_columns = (
+        {column["name"] for column in inspector.get_columns("engineer_runtimes")}
+        if "engineer_runtimes" in runtime_tables
+        else set()
+    )
     timestamp_type = "TIMESTAMP" if engine.dialect.name == "sqlite" else "TIMESTAMP WITH TIME ZONE"
     statements: list[str] = []
 
@@ -107,9 +116,16 @@ def ensure_runtime_schema() -> None:
         statements.append("ALTER TABLE projects ADD COLUMN deployment_instructions TEXT DEFAULT ''")
     if "testing_rework_count" not in task_columns:
         statements.append("ALTER TABLE tasks ADD COLUMN testing_rework_count INTEGER DEFAULT 0")
+    if "release_queue_entered_at" not in task_columns:
+        statements.append(f"ALTER TABLE tasks ADD COLUMN release_queue_entered_at {timestamp_type}")
     if "outcome_payload_json" not in task_run_columns:
         json_type = "TEXT" if engine.dialect.name == "sqlite" else "JSON"
         statements.append(f"ALTER TABLE task_runs ADD COLUMN outcome_payload_json {json_type}")
+    if "claimed_by_runtime_id" not in task_run_columns:
+        nullable_integer = "INTEGER"
+        statements.append(f"ALTER TABLE task_runs ADD COLUMN claimed_by_runtime_id {nullable_integer}")
+    if "engineer_runtimes" in runtime_tables and "current_task_run_id" not in runtime_columns:
+        statements.append("ALTER TABLE engineer_runtimes ADD COLUMN current_task_run_id INTEGER")
 
     if statements:
         with engine.begin() as connection:
@@ -244,11 +260,14 @@ def delete_engineer_route(engineer_id: int, db: Session = Depends(get_db)) -> di
         get_engineer_or_404(db, engineer_id),
         settings.engineer_heartbeat_timeout_seconds,
     )
-    if engineer.runtime_status in {
-        EngineerRuntimeStatus.STARTING,
-        EngineerRuntimeStatus.HEALTHY,
-        EngineerRuntimeStatus.HEARTBEAT_MISSING,
-    } or engineer.runtime_container_name:
+    if any(
+        runtime.runtime_status in {
+            EngineerRuntimeStatus.STARTING,
+            EngineerRuntimeStatus.HEALTHY,
+            EngineerRuntimeStatus.HEARTBEAT_MISSING,
+        }
+        for runtime in engineer.runtimes
+    ):
         raise HTTPException(status_code=400, detail="Cannot delete a running engineer. Stop the runtime first.")
     delete_engineer(db, engineer_id)
     return {"deleted": True}
@@ -256,40 +275,91 @@ def delete_engineer_route(engineer_id: int, db: Session = Depends(get_db)) -> di
 
 @app.post("/engineers/{engineer_id}/launch", response_model=EngineerRead)
 def launch_engineer(engineer_id: int, db: Session = Depends(get_db)) -> Engineer:
-    engineer = refresh_engineer_runtime_health(
-        db,
-        get_engineer_or_404(db, engineer_id),
-        settings.engineer_heartbeat_timeout_seconds,
-    )
+    engineer = get_engineer_or_404(db, engineer_id)
     codex_auth_json = get_config_setting_by_key(db, "codex_auth_json").value
     github_token_setting = get_optional_config_setting_by_key(db, "github_developer_token")
     github_token = github_token_setting.value if github_token_setting else ""
     aws_access_key_id_setting = get_optional_config_setting_by_key(db, "aws_access_key_id")
     aws_secret_access_key_setting = get_optional_config_setting_by_key(db, "aws_secret_access_key")
     aws_region_setting = get_optional_config_setting_by_key(db, "aws_region")
-    container_name, container_id = runtime_manager.launch_engineer(
-        engineer,
-        codex_auth_json,
-        github_token,
-        aws_access_key_id_setting.value if aws_access_key_id_setting else "",
-        aws_secret_access_key_setting.value if aws_secret_access_key_setting else "",
-        aws_region_setting.value if aws_region_setting else "",
+    runtime = create_engineer_runtime(db, engineer)
+    try:
+        container_name, container_id = runtime_manager.launch_engineer(
+            engineer,
+            runtime,
+            codex_auth_json,
+            github_token,
+            aws_access_key_id_setting.value if aws_access_key_id_setting else "",
+            aws_secret_access_key_setting.value if aws_secret_access_key_setting else "",
+            aws_region_setting.value if aws_region_setting else "",
+        )
+        mark_engineer_runtime_launching(db, runtime, container_name, container_id)
+    except Exception:
+        runtime.runtime_status = EngineerRuntimeStatus.LAUNCH_FAILED
+        runtime.status_message = "Runtime launch failed."
+        db.add(runtime)
+        db.commit()
+        raise
+    refreshed_engineer = refresh_engineer_runtime_health(
+        db,
+        get_engineer_or_404(db, engineer_id),
+        settings.engineer_heartbeat_timeout_seconds,
     )
-    return mark_engineer_runtime_launching(db, engineer, container_name, container_id)
+    return refreshed_engineer
+
+
+@app.post("/engineer-runtimes/{runtime_id}/stop", response_model=EngineerRuntimeRead)
+def stop_engineer_runtime(runtime_id: int, db: Session = Depends(get_db)) -> EngineerRuntime:
+    runtime = get_engineer_runtime_or_404(db, runtime_id)
+    runtime_manager.stop_engineer_runtime(runtime)
+    return mark_engineer_runtime_stopped(db, runtime, "Runtime stopped by user.")
+
+
+@app.post("/engineer-runtimes/{runtime_id}/restart", response_model=EngineerRuntimeRead)
+def restart_engineer_runtime(runtime_id: int, db: Session = Depends(get_db)) -> EngineerRuntime:
+    runtime = get_engineer_runtime_or_404(db, runtime_id)
+    engineer = get_engineer_or_404(db, runtime.engineer_id)
+    runtime_manager.stop_engineer_runtime(runtime)
+    mark_engineer_runtime_stopped(db, runtime, "Runtime restarting.")
+    codex_auth_json = get_config_setting_by_key(db, "codex_auth_json").value
+    github_token_setting = get_optional_config_setting_by_key(db, "github_developer_token")
+    github_token = github_token_setting.value if github_token_setting else ""
+    aws_access_key_id_setting = get_optional_config_setting_by_key(db, "aws_access_key_id")
+    aws_secret_access_key_setting = get_optional_config_setting_by_key(db, "aws_secret_access_key")
+    aws_region_setting = get_optional_config_setting_by_key(db, "aws_region")
+    try:
+        container_name, container_id = runtime_manager.launch_engineer(
+            engineer,
+            runtime,
+            codex_auth_json,
+            github_token,
+            aws_access_key_id_setting.value if aws_access_key_id_setting else "",
+            aws_secret_access_key_setting.value if aws_secret_access_key_setting else "",
+            aws_region_setting.value if aws_region_setting else "",
+        )
+        return mark_engineer_runtime_launching(db, runtime, container_name, container_id)
+    except Exception:
+        runtime.runtime_status = EngineerRuntimeStatus.LAUNCH_FAILED
+        runtime.status_message = "Runtime restart failed."
+        db.add(runtime)
+        db.commit()
+        raise
 
 
 @app.post("/engineers/{engineer_id}/stop", response_model=EngineerRead)
 def stop_engineer(engineer_id: int, db: Session = Depends(get_db)) -> Engineer:
     engineer = get_engineer_or_404(db, engineer_id)
-    runtime_manager.stop_engineer(engineer)
-    return mark_engineer_runtime_stopped(db, engineer, "Runtime stopped by user.")
+    for runtime in engineer.runtimes:
+        runtime_manager.stop_engineer_runtime(runtime)
+        mark_engineer_runtime_stopped(db, runtime, "Runtime stopped by user.")
+    return refresh_engineer_runtime_health(db, get_engineer_or_404(db, engineer_id), settings.engineer_heartbeat_timeout_seconds)
 
 
-@app.post("/engineers/{engineer_id}/heartbeat", response_model=EngineerRead)
-def engineer_heartbeat(engineer_id: int, payload: EngineerHeartbeat, db: Session = Depends(get_db)) -> Engineer:
-    return record_engineer_heartbeat(
+@app.post("/engineer-runtimes/{runtime_id}/heartbeat", response_model=EngineerRuntimeRead)
+def engineer_runtime_heartbeat(runtime_id: int, payload: EngineerHeartbeat, db: Session = Depends(get_db)) -> EngineerRuntime:
+    return record_engineer_runtime_heartbeat(
         db,
-        engineer_id=engineer_id,
+        runtime_id=runtime_id,
         container_name=payload.container_name,
         container_id=payload.container_id,
         status_message=payload.status_message,
@@ -371,13 +441,13 @@ def reject_run(task_run_id: int, payload: TaskRunApprovalRequest, db: Session = 
 
 @app.post("/agent/poll-next-task", response_model=AgentPollResponse)
 def agent_poll(payload: AgentPollRequest, db: Session = Depends(get_db)) -> AgentPollResponse:
-    task_run, task = poll_next_task(db, payload.engineer_id)
-    if not task_run or not task:
+    task_run, task, runtime = poll_next_task(db, payload.runtime_id)
+    if not task_run or not task or not runtime:
         return AgentPollResponse()
     project = get_project_or_404(db, task.project_id)
-    engineer = get_engineer_or_404(db, payload.engineer_id)
+    engineer = get_engineer_or_404(db, runtime.engineer_id)
     task_bundle = build_task_bundle(task, project, engineer)
-    return AgentPollResponse(task_run=task_run, task=task, project=project, engineer=engineer, task_bundle=task_bundle)
+    return AgentPollResponse(task_run=task_run, task=task, project=project, engineer=engineer, runtime=runtime, task_bundle=task_bundle)
 
 
 @app.post("/agent/task-runs/{task_run_id}/heartbeat", response_model=TaskRunRead)
