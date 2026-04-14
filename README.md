@@ -1,5 +1,8 @@
 # Dev Boss
 
+- Website: [https://www.devboss.xyz/](https://www.devboss.xyz/)
+- YouTube Intro: [https://youtu.be/cHeKkuT0XBQ](https://youtu.be/cHeKkuT0XBQ)
+
 Dev Boss is an MVP platform for running an AI engineering team through a single dashboard. It manages projects, tasks, engineers, task runs, comments, approvals, and deployment handoffs across a full software delivery workflow.
 
 This repository contains:
