@@ -871,6 +871,14 @@ def create_engineer_runtime(db: Session, engineer: Engineer) -> EngineerRuntime:
     return runtime
 
 
+def find_reusable_engineer_runtime(engineer: Engineer) -> EngineerRuntime | None:
+    reusable_statuses = {EngineerRuntimeStatus.STOPPED, EngineerRuntimeStatus.LAUNCH_FAILED}
+    reusable_runtimes = [runtime for runtime in (engineer.runtimes or []) if runtime.runtime_status in reusable_statuses]
+    if not reusable_runtimes:
+        return None
+    return max(reusable_runtimes, key=lambda runtime: runtime.created_at)
+
+
 def mark_engineer_runtime_launching(
     db: Session,
     runtime: EngineerRuntime,

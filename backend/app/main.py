@@ -51,6 +51,7 @@ from app.services import (
     delete_project,
     delete_task,
     build_task_bundle,
+    find_reusable_engineer_runtime,
     create_config_setting,
     delete_config_setting,
     create_task,
@@ -282,7 +283,7 @@ def launch_engineer(engineer_id: int, db: Session = Depends(get_db)) -> Engineer
     aws_access_key_id_setting = get_optional_config_setting_by_key(db, "aws_access_key_id")
     aws_secret_access_key_setting = get_optional_config_setting_by_key(db, "aws_secret_access_key")
     aws_region_setting = get_optional_config_setting_by_key(db, "aws_region")
-    runtime = create_engineer_runtime(db, engineer)
+    runtime = find_reusable_engineer_runtime(engineer) or create_engineer_runtime(db, engineer)
     try:
         container_name, container_id = runtime_manager.launch_engineer(
             engineer,

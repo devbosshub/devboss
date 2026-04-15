@@ -531,6 +531,60 @@ def test_engineer_launch_stop_and_health_ping(client):
         main_module.runtime_manager = original_runtime_manager
 
 
+def test_launch_engineer_reuses_latest_stopped_runtime(client, db_session):
+    engineer = client.get("/engineers").json()[0]
+    stopped_runtime = create_runtime(db_session, engineer["id"], EngineerRuntimeStatus.STOPPED)
+
+    client.post(
+        "/settings",
+        json={
+            "key": "codex_auth_json",
+            "value": "{\"provider\":\"chatgpt\",\"token\":\"example\"}",
+            "is_secret": True,
+            "description": "Codex auth file content",
+        },
+    )
+    client.post(
+        "/settings",
+        json={
+            "key": "github_developer_token",
+            "value": "ghp_example",
+            "is_secret": True,
+            "description": "GitHub token for runtime repo checkout",
+        },
+    )
+
+    class FakeRuntimeManager:
+        def launch_engineer(
+            self,
+            engineer_record,
+            runtime_record,
+            codex_auth_json,
+            github_token,
+            aws_access_key_id,
+            aws_secret_access_key,
+            aws_region,
+        ):
+            assert runtime_record.id == stopped_runtime.id
+            return (f"devboss-engineer-{engineer_record.id}-{runtime_record.id}", "container-reused")
+
+        def stop_engineer_runtime(self, runtime_record):
+            return None
+
+    original_runtime_manager = main_module.runtime_manager
+    main_module.runtime_manager = FakeRuntimeManager()
+    try:
+        launch_response = client.post(f"/engineers/{engineer['id']}/launch")
+        assert launch_response.status_code == 200
+        launched = launch_response.json()
+        assert launched["runtime_count"] == 1
+        assert launched["runtimes"][0]["id"] == stopped_runtime.id
+        assert launched["runtimes"][0]["runtime_status"] == "starting"
+        assert launched["runtime_container_name"] == f"devboss-engineer-{engineer['id']}-{stopped_runtime.id}"
+    finally:
+        main_module.runtime_manager = original_runtime_manager
+
+
 def test_delete_engineer_blocks_when_running_and_when_referenced(client):
     create_response = client.post(
         "/engineers",

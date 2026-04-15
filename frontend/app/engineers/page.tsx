@@ -50,6 +50,22 @@ function formatRuntimeDuration(startedAt: string | null) {
   return `${elapsedSeconds}s`;
 }
 
+function formatRuntimeDetails(runtime: EngineerRuntime) {
+  const isBusy = runtime.current_task_run_id !== null;
+  const isRunning = ["starting", "healthy", "heartbeat_missing"].includes(runtime.runtime_status);
+  const statusLine = runtime.status_message?.trim();
+
+  if (isRunning) {
+    return `Running for ${formatRuntimeDuration(runtime.started_at)}${isBusy ? ` • Task run #${runtime.current_task_run_id}` : ""}`;
+  }
+
+  if (statusLine) {
+    return statusLine;
+  }
+
+  return "Runtime is not running.";
+}
+
 function ActionIcon({ kind }: { kind: "launch" | "stop" | "restart" | "edit" | "delete" }) {
   if (kind === "launch") {
     return (
@@ -171,12 +187,19 @@ export default function EngineersPage() {
     }
 
     return confirmAction.kind === "restart-runtime"
-      ? {
-          title: "Restart runtime?",
-          label: "Restart runtime",
-          className: "button",
-          description: `This will restart runtime #${confirmAction.runtime.id} for ${confirmAction.engineerName}.`
-        }
+      ? ["stopped", "launch_failed"].includes(confirmAction.runtime.runtime_status)
+        ? {
+            title: "Start runtime?",
+            label: "Start runtime",
+            className: "button",
+            description: `This will start runtime #${confirmAction.runtime.id} for ${confirmAction.engineerName}.`
+          }
+        : {
+            title: "Restart runtime?",
+            label: "Restart runtime",
+            className: "button",
+            description: `This will restart runtime #${confirmAction.runtime.id} for ${confirmAction.engineerName}.`
+          }
       : {
           title: "Stop runtime?",
           label: "Stop runtime",
@@ -251,7 +274,11 @@ export default function EngineersPage() {
                 </tr>
               </thead>
               <tbody>
-                {engineers.map((engineer) => (
+                {engineers.map((engineer) => {
+                  const hasReusableRuntime = engineer.runtimes.some((runtime) =>
+                    ["stopped", "launch_failed"].includes(runtime.runtime_status)
+                  );
+                  return (
                   <tr key={engineer.id}>
                     <td>{engineer.name}</td>
                     <td>{templateLabels[engineer.template] ?? engineer.template}</td>
@@ -281,7 +308,6 @@ export default function EngineersPage() {
                         <div className="stack-compact">
                           {engineer.runtimes.map((runtime) => {
                             const runtimeKey = `runtime-${runtime.id}`;
-                            const isBusy = runtime.current_task_run_id !== null;
                             const isRunning = ["starting", "healthy", "heartbeat_missing"].includes(runtime.runtime_status);
                             return (
                               <div className="table-runtime-row" key={runtime.id}>
@@ -289,23 +315,21 @@ export default function EngineersPage() {
                                   <span className={`tag compact${runtime.runtime_status === "healthy" ? "" : runtime.runtime_status === "heartbeat_missing" || runtime.runtime_status === "launch_failed" ? " danger" : " warning"}`}>
                                     #{runtime.id} {runtimeStatusLabels[runtime.runtime_status] ?? runtime.runtime_status}
                                   </span>
-                                  <span className="table-subtext">
-                                    Running for {formatRuntimeDuration(runtime.started_at)}{isBusy ? ` • Task run #${runtime.current_task_run_id}` : ""}
-                                  </span>
+                                  <span className="table-subtext">{formatRuntimeDetails(runtime)}</span>
                                 </div>
                                 <div className="table-actions">
+                                  <button
+                                    aria-label={isRunning ? "Restart runtime" : "Start runtime"}
+                                    className={`icon-button ${isRunning ? "warning" : "success"}`}
+                                    disabled={activeKey === runtimeKey || isPending}
+                                    onClick={() => setConfirmAction({ kind: "restart-runtime", engineerName: engineer.name, runtime })}
+                                    title={isRunning ? "Restart runtime" : "Start runtime"}
+                                    type="button"
+                                  >
+                                    <ActionIcon kind={isRunning ? "restart" : "launch"} />
+                                  </button>
                                   {isRunning ? (
                                     <>
-                                      <button
-                                        aria-label="Restart runtime"
-                                        className="icon-button warning"
-                                        disabled={activeKey === runtimeKey || isPending}
-                                        onClick={() => setConfirmAction({ kind: "restart-runtime", engineerName: engineer.name, runtime })}
-                                        title="Restart runtime"
-                                        type="button"
-                                      >
-                                        <ActionIcon kind="restart" />
-                                      </button>
                                       <button
                                         aria-label="Stop runtime"
                                         className="icon-button danger"
@@ -328,7 +352,7 @@ export default function EngineersPage() {
                     <td className="action-cell">
                       <div className="table-actions">
                         <button
-                          aria-label="Launch new runtime"
+                          aria-label={hasReusableRuntime ? "Run stopped runtime" : "Launch new runtime"}
                           className="icon-button success"
                           disabled={activeKey === `engineer-${engineer.id}` || isPending}
                           onClick={() =>
@@ -345,7 +369,7 @@ export default function EngineersPage() {
                               }
                             })
                           }
-                          title="Launch another runtime"
+                          title={hasReusableRuntime ? "Run stopped runtime" : "Launch new runtime"}
                           type="button"
                         >
                           <ActionIcon kind="launch" />
@@ -371,7 +395,8 @@ export default function EngineersPage() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
