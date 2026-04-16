@@ -4,7 +4,7 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 
 import { api } from "@/lib/api";
-import { ConfigSetting, Engineer, EngineerTemplate, Project, Task, TaskStatus } from "@/lib/types";
+import { ConfigSetting, Engineer, EngineerTemplate, Project, RuntimeConfig, Task, TaskStatus } from "@/lib/types";
 
 export function ProjectForm({
   project,
@@ -152,6 +152,9 @@ export function EngineerForm({
 }) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
+  const initialRuntimeConfig: RuntimeConfig = engineer?.runtime_config ?? {
+    max_active_tasks: 1
+  };
   const [name, setName] = useState(engineer?.name ?? "");
   const [template, setTemplate] = useState<EngineerTemplate>(engineer?.template ?? "backend_engineer");
   const [skillMarkdown, setSkillMarkdown] = useState(engineer?.skill_markdown ?? templateDescriptions[engineer?.template ?? "backend_engineer"]);
@@ -159,6 +162,7 @@ export function EngineerForm({
   const [dockerImage, setDockerImage] = useState(engineer?.docker_image ?? "devboss-engineer:latest");
   const [pollIntervalSeconds, setPollIntervalSeconds] = useState(String(engineer?.poll_interval_seconds ?? 30));
   const [isActive, setIsActive] = useState(engineer?.is_active ?? true);
+  const [cavemanEnabled, setCavemanEnabled] = useState(initialRuntimeConfig.caveman_enabled === true);
 
   return (
     <form
@@ -166,6 +170,13 @@ export function EngineerForm({
       onSubmit={(event) => {
         event.preventDefault();
         startTransition(async () => {
+          const runtimeConfig: RuntimeConfig = { ...initialRuntimeConfig };
+
+          if (cavemanEnabled) {
+            runtimeConfig.caveman_enabled = true;
+          } else {
+            delete runtimeConfig.caveman_enabled;
+          }
           const payload = {
             name,
             template,
@@ -175,9 +186,7 @@ export function EngineerForm({
             poll_interval_seconds: Number(pollIntervalSeconds),
             enabled_tools: engineer?.enabled_tools ?? ["git", "shell", "tests"],
             allowed_projects: engineer?.allowed_projects ?? [],
-            runtime_config: engineer?.runtime_config ?? {
-              max_active_tasks: 1
-            },
+            runtime_config: runtimeConfig,
             is_active: isActive
           } satisfies Partial<Engineer>;
 
@@ -237,6 +246,18 @@ export function EngineerForm({
           <option value="active">Active</option>
           <option value="inactive">Inactive</option>
         </select>
+      </label>
+      <label className="checkbox-field" htmlFor="caveman-terse-mode">
+        <span className="checkbox-copy">
+          <span className="checkbox-title">Caveman terse mode</span>
+          <span className="checkbox-description">Enable compact Codex responses for this engineer runtime.</span>
+        </span>
+        <input
+          id="caveman-terse-mode"
+          checked={cavemanEnabled}
+          onChange={(event) => setCavemanEnabled(event.target.checked)}
+          type="checkbox"
+        />
       </label>
       <label className="field">
         <span>Skill markdown</span>

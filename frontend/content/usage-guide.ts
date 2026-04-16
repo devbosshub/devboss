@@ -147,6 +147,12 @@ Authentication is currently provided through the \`codex_auth_json\` global conf
 - the runtime writes it to \`/root/.codex/auth.json\`
 - Codex CLI then uses that auth state during execution
 
+Engineers can also opt into Caveman-style terse responses through \`runtime_config.caveman_enabled\`.
+
+- when enabled, the runtime writes \`/root/.codex/config.toml\` with Codex hooks turned on
+- it also writes \`/root/.codex/hooks.json\` so each Codex session starts with a terse-response instruction
+- when disabled, those files are removed and runtime behavior stays unchanged
+
 ### GitHub
 
 Git operations and PR creation rely on \`github_developer_token\`.

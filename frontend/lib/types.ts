@@ -22,6 +22,11 @@ export type EngineerRuntimeStatus =
   | "heartbeat_missing"
   | "launch_failed";
 
+export type RuntimeConfig = {
+  caveman_enabled?: boolean;
+  [key: string]: unknown;
+};
+
 export type CommentAuthorType = "human" | "agent" | "system";
 
 export type Project = {
@@ -46,7 +51,7 @@ export type Engineer = {
   poll_interval_seconds: number;
   enabled_tools: string[];
   allowed_projects: string[];
-  runtime_config: Record<string, unknown>;
+  runtime_config: RuntimeConfig;
   is_active: boolean;
   runtime_status: EngineerRuntimeStatus;
   runtime_container_name: string | null;

@@ -42,6 +42,7 @@ class DockerRuntimeManager:
     ) -> tuple[str, str]:
         client = self._client()
         container_name = f"devboss-engineer-{engineer.id}-{runtime.id}"
+        caveman_enabled = bool((engineer.runtime_config or {}).get("caveman_enabled"))
 
         try:
             existing = client.containers.get(container_name)
@@ -65,6 +66,7 @@ class DockerRuntimeManager:
             "DEVBOSS_CODEX_AUTH_JSON": codex_auth_json,
             "DEVBOSS_GITHUB_TOKEN": github_token,
             "DEVBOSS_DRY_RUN": "false",
+            "DEVBOSS_CAVEMAN_ENABLED": "true" if caveman_enabled else "false",
             "AWS_ACCESS_KEY_ID": aws_access_key_id,
             "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
             "AWS_DEFAULT_REGION": aws_region,

@@ -1,11 +1,17 @@
 #!/bin/sh
 set -eu
 
-mkdir -p /root/.codex
+python - <<'PY'
+from pathlib import Path
+import os
 
-if [ -n "${DEVBOSS_CODEX_AUTH_JSON:-}" ]; then
-  printf '%s' "$DEVBOSS_CODEX_AUTH_JSON" > /root/.codex/auth.json
-  chmod 600 /root/.codex/auth.json
-fi
+from runtime.codex_home import configure_codex_home
+
+configure_codex_home(
+    Path("/root/.codex"),
+    os.environ.get("DEVBOSS_CODEX_AUTH_JSON"),
+    os.environ.get("DEVBOSS_CAVEMAN_ENABLED", "").lower() == "true",
+)
+PY
 
 exec python -m runtime.main
