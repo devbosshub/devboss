@@ -1,16 +1,17 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.database import Base, engine, get_db
-from app.enums import ArtifactKind, EngineerRuntimeStatus, RunStatus, TaskStatus
-from app.models import ConfigSetting, Engineer, EngineerRuntime, Project, Task, TaskRun
+from app.enums import ArtifactKind, CommentAuthorType, EngineerRuntimeStatus, MembershipRole, ModelProvider, PRDStatus, RunStatus, StatusGroup, TaskStatus, PROVIDER_ENV_VAR_MAP
+from app.models import ConfigSetting, Engineer, EngineerRuntime, Organization, OrganizationMember, PRD, PRDComment, Project, Tag, Task, TaskRun, TokenUsage, User, Workflow, WorkflowStage
 from app.schemas import (
     AgentHeartbeat,
     AgentLog,
@@ -20,16 +21,32 @@ from app.schemas import (
     BoardLane,
     BoardRead,
     ConfigSettingCreate,
-    EngineerHeartbeat,
     ConfigSettingRead,
     ConfigSettingUpdate,
     EngineerCreate,
+    EngineerHeartbeat,
     EngineerRead,
     EngineerRuntimeRead,
     EngineerUpdate,
+    OrgMemberCreate,
+    OrganizationCreate,
+    OrganizationMemberRead,
+    OrganizationRead,
+    OrganizationUpdate,
+    PRDCommentCreate,
+    PRDCommentRead,
+    PRDChatMessage,
+    PRDConvertRequest,
+    PRDCreate,
+    PRDRead,
+    PRDUpdate,
+    PRDTagsUpdate,
     ProjectCreate,
     ProjectRead,
     ProjectUpdate,
+    StageReorderRequest,
+    TagCreate,
+    TagRead,
     TaskCommentCreate,
     TaskCommentRead,
     TaskCreate,
@@ -37,46 +54,85 @@ from app.schemas import (
     TaskRunApprovalRequest,
     TaskRunRead,
     TaskUpdate,
+    TaskTagsUpdate,
+    TokenSummary,
+    TokenUsageCreate,
+    TokenUsageRead,
+    UserRead,
+    WorkflowCreate,
+    WorkflowRead,
+    WorkflowStageCreate,
+    WorkflowStageRead,
+    WorkflowStageUpdate,
+    WorkflowUpdate,
 )
 from app.runtime_manager import DockerRuntimeManager
 from app.seed import seed_demo_workspace, seed_engineers
 from app.services import (
     add_agent_log,
     add_comment,
+    add_org_member,
+    add_prd_comment,
     apply_agent_outcome,
     approve_task_run,
+    archive_organization as delete_organization_svc,
+    convert_prd_to_tasks,
+    create_config_setting,
     create_engineer_runtime,
+    create_organization,
+    create_prd,
+    create_tag as create_tag_svc,
+    create_task,
+    create_workflow_stage,
     delete_comment,
     delete_engineer,
     delete_project,
+    delete_tag as delete_tag_svc,
     delete_task,
+    delete_workflow_stage,
     build_task_bundle,
     find_reusable_engineer_runtime,
-    create_config_setting,
-    delete_config_setting,
-    create_task,
     get_config_setting_by_key,
     get_engineer_or_404,
     get_engineer_runtime_or_404,
     get_optional_config_setting_by_key,
+    get_organization_or_404,
+    get_or_create_user,
+    get_prd_or_404,
     get_project_or_404,
+    get_project_token_summary,
+    get_tag_or_404,
     get_task_or_404,
-    list_engineers_with_runtime_health,
+    get_task_token_summary,
+    get_workflow_or_404,
+    get_workflow_stage_or_404,
     list_attention_tasks,
     list_config_settings,
+    list_engineers_with_runtime_health,
+    list_organizations,
+    list_prds,
     list_tasks_by_status,
+    list_workflows,
     mark_engineer_runtime_launching,
     mark_engineer_runtime_stopped,
     maybe_create_task_run,
     poll_next_task,
     record_engineer_runtime_heartbeat,
+    record_token_usage,
     refresh_engineer_runtime_health,
     reject_task_run,
+    remove_org_member,
+    reorder_workflow_stages,
     retry_task,
+    set_prd_tags,
+    set_task_tags,
     store_artifact,
     update_config_setting,
     update_heartbeat,
+    update_org_member_role,
+    update_prd,
     update_task,
+    update_workflow_stage,
 )
 from app.storage import LocalArtifactStorage
 
@@ -125,8 +181,24 @@ def ensure_runtime_schema() -> None:
     if "claimed_by_runtime_id" not in task_run_columns:
         nullable_integer = "INTEGER"
         statements.append(f"ALTER TABLE task_runs ADD COLUMN claimed_by_runtime_id {nullable_integer}")
+    if "model_provider" not in engineer_columns:
+        statements.append("ALTER TABLE engineers ADD COLUMN model_provider VARCHAR(64) DEFAULT 'deepseek'")
     if "engineer_runtimes" in runtime_tables and "current_task_run_id" not in runtime_columns:
         statements.append("ALTER TABLE engineer_runtimes ADD COLUMN current_task_run_id INTEGER")
+    if "workflow_id" not in project_columns:
+        statements.append("ALTER TABLE projects ADD COLUMN workflow_id INTEGER")
+    if "workflow_stage_id" not in task_columns:
+        statements.append("ALTER TABLE tasks ADD COLUMN workflow_stage_id INTEGER")
+    if "status_group" not in task_columns:
+        statements.append("ALTER TABLE tasks ADD COLUMN status_group VARCHAR(64) DEFAULT 'todo'")
+    if "rework_count" not in task_columns:
+        statements.append("ALTER TABLE tasks ADD COLUMN rework_count INTEGER DEFAULT 0")
+    if "workflow_stage_id" not in task_run_columns:
+        statements.append("ALTER TABLE task_runs ADD COLUMN workflow_stage_id INTEGER")
+    if "attempt_number" not in task_run_columns:
+        statements.append("ALTER TABLE task_runs ADD COLUMN attempt_number INTEGER DEFAULT 1")
+    if "organization_id" not in project_columns:
+        statements.append("ALTER TABLE projects ADD COLUMN organization_id INTEGER")
 
     if statements:
         with engine.begin() as connection:
@@ -136,6 +208,7 @@ def ensure_runtime_schema() -> None:
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
             connection.execute(text("ALTER TYPE runphase ADD VALUE IF NOT EXISTS 'READY_TO_DEPLOY'"))
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -164,6 +237,82 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/workflows", response_model=WorkflowRead)
+def create_workflow(payload: WorkflowCreate, db: Session = Depends(get_db)) -> Workflow:
+    workflow = Workflow(**payload.model_dump())
+    db.add(workflow)
+    db.commit()
+    db.refresh(workflow)
+    return db.scalar(
+        select(Workflow).options(selectinload(Workflow.stages)).where(Workflow.id == workflow.id)
+    )
+
+
+@app.get("/workflows", response_model=list[WorkflowRead])
+def list_workflows_route(db: Session = Depends(get_db)) -> list[Workflow]:
+    return list_workflows(db)
+
+
+@app.get("/workflows/{workflow_id}", response_model=WorkflowRead)
+def get_workflow(workflow_id: int, db: Session = Depends(get_db)) -> Workflow:
+    return get_workflow_or_404(db, workflow_id)
+
+
+@app.patch("/workflows/{workflow_id}", response_model=WorkflowRead)
+def patch_workflow(workflow_id: int, payload: WorkflowUpdate, db: Session = Depends(get_db)) -> Workflow:
+    workflow = get_workflow_or_404(db, workflow_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(workflow, field, value)
+    workflow.updated_at = datetime.now()
+    db.add(workflow)
+    db.commit()
+    return get_workflow_or_404(db, workflow_id)
+
+
+@app.delete("/workflows/{workflow_id}")
+def delete_workflow(workflow_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    workflow = get_workflow_or_404(db, workflow_id)
+    db.delete(workflow)
+    db.commit()
+    return {"deleted": True}
+
+
+@app.post("/workflows/{workflow_id}/stages", response_model=WorkflowStageRead)
+def create_workflow_stage_route(
+    workflow_id: int, payload: WorkflowStageCreate, db: Session = Depends(get_db)
+) -> WorkflowStage:
+    return create_workflow_stage(db, workflow_id, payload.model_dump())
+
+
+@app.patch("/workflows/{workflow_id}/stages/{stage_id}", response_model=WorkflowStageRead)
+def patch_workflow_stage(
+    workflow_id: int, stage_id: int, payload: WorkflowStageUpdate, db: Session = Depends(get_db)
+) -> WorkflowStage:
+    stage = get_workflow_stage_or_404(db, stage_id)
+    if stage.workflow_id != workflow_id:
+        raise HTTPException(status_code=404, detail="Stage not found in this workflow")
+    return update_workflow_stage(db, stage_id, payload.model_dump(exclude_unset=True))
+
+
+@app.delete("/workflows/{workflow_id}/stages/{stage_id}")
+def delete_workflow_stage_route(
+    workflow_id: int, stage_id: int, db: Session = Depends(get_db)
+) -> dict[str, bool]:
+    stage = get_workflow_stage_or_404(db, stage_id)
+    if stage.workflow_id != workflow_id:
+        raise HTTPException(status_code=404, detail="Stage not found in this workflow")
+    delete_workflow_stage(db, stage_id)
+    return {"deleted": True}
+
+
+@app.patch("/workflows/{workflow_id}/stages/reorder", response_model=list[WorkflowStageRead])
+def reorder_workflow_stages_route(
+    workflow_id: int, payload: StageReorderRequest, db: Session = Depends(get_db)
+) -> list[WorkflowStage]:
+    items = [item.model_dump() for item in payload.stages]
+    return reorder_workflow_stages(db, workflow_id, items)
 
 
 @app.post("/projects", response_model=ProjectRead)
@@ -277,7 +426,9 @@ def delete_engineer_route(engineer_id: int, db: Session = Depends(get_db)) -> di
 @app.post("/engineers/{engineer_id}/launch", response_model=EngineerRead)
 def launch_engineer(engineer_id: int, db: Session = Depends(get_db)) -> Engineer:
     engineer = get_engineer_or_404(db, engineer_id)
-    codex_auth_json = get_config_setting_by_key(db, "codex_auth_json").value
+    provider_key = f"{engineer.model_provider}_api_key"
+    provider_api_key = get_config_setting_by_key(db, provider_key).value
+    provider_env_var = PROVIDER_ENV_VAR_MAP[ModelProvider(engineer.model_provider)]
     github_token_setting = get_optional_config_setting_by_key(db, "github_developer_token")
     github_token = github_token_setting.value if github_token_setting else ""
     aws_access_key_id_setting = get_optional_config_setting_by_key(db, "aws_access_key_id")
@@ -288,7 +439,8 @@ def launch_engineer(engineer_id: int, db: Session = Depends(get_db)) -> Engineer
         container_name, container_id = runtime_manager.launch_engineer(
             engineer,
             runtime,
-            codex_auth_json,
+            provider_api_key,
+            provider_env_var,
             github_token,
             aws_access_key_id_setting.value if aws_access_key_id_setting else "",
             aws_secret_access_key_setting.value if aws_secret_access_key_setting else "",
@@ -322,7 +474,9 @@ def restart_engineer_runtime(runtime_id: int, db: Session = Depends(get_db)) -> 
     engineer = get_engineer_or_404(db, runtime.engineer_id)
     runtime_manager.stop_engineer_runtime(runtime)
     mark_engineer_runtime_stopped(db, runtime, "Runtime restarting.")
-    codex_auth_json = get_config_setting_by_key(db, "codex_auth_json").value
+    provider_key = f"{engineer.model_provider}_api_key"
+    provider_api_key = get_config_setting_by_key(db, provider_key).value
+    provider_env_var = PROVIDER_ENV_VAR_MAP[ModelProvider(engineer.model_provider)]
     github_token_setting = get_optional_config_setting_by_key(db, "github_developer_token")
     github_token = github_token_setting.value if github_token_setting else ""
     aws_access_key_id_setting = get_optional_config_setting_by_key(db, "aws_access_key_id")
@@ -332,7 +486,8 @@ def restart_engineer_runtime(runtime_id: int, db: Session = Depends(get_db)) -> 
         container_name, container_id = runtime_manager.launch_engineer(
             engineer,
             runtime,
-            codex_auth_json,
+            provider_api_key,
+            provider_env_var,
             github_token,
             aws_access_key_id_setting.value if aws_access_key_id_setting else "",
             aws_secret_access_key_setting.value if aws_secret_access_key_setting else "",
@@ -411,8 +566,20 @@ def get_attention_tasks(db: Session = Depends(get_db)) -> list[Task]:
 
 @app.get("/projects/{project_id}/board", response_model=BoardRead)
 def get_project_board(project_id: int, db: Session = Depends(get_db)) -> BoardRead:
-    get_project_or_404(db, project_id)
+    project = get_project_or_404(db, project_id)
     tasks = list_tasks_by_status(db, project_id=project_id)
+
+    if project.workflow_id:
+        workflow = db.scalar(
+            select(Workflow).options(selectinload(Workflow.stages)).where(Workflow.id == project.workflow_id)
+        )
+        if workflow and workflow.stages:
+            lanes = []
+            for stage in sorted(workflow.stages, key=lambda s: s.stage_order):
+                tasks_in_stage = [task for task in tasks if task.workflow_stage_id == stage.id]
+                lanes.append(BoardLane(status=TaskStatus.DRAFT, tasks=tasks_in_stage))
+            return BoardRead(lanes=lanes)
+
     lanes = []
     for status in TaskStatus:
         lanes.append(BoardLane(status=status, tasks=[task for task in tasks if task.status == status]))
@@ -448,7 +615,16 @@ def agent_poll(payload: AgentPollRequest, db: Session = Depends(get_db)) -> Agen
     project = get_project_or_404(db, task.project_id)
     engineer = get_engineer_or_404(db, runtime.engineer_id)
     task_bundle = build_task_bundle(task, project, engineer)
-    return AgentPollResponse(task_run=task_run, task=task, project=project, engineer=engineer, runtime=runtime, task_bundle=task_bundle)
+    stage = task.current_stage
+    return AgentPollResponse(
+        task_run=task_run,
+        task=task,
+        project=project,
+        engineer=engineer,
+        runtime=runtime,
+        task_bundle=task_bundle,
+        stage=stage,
+    )
 
 
 @app.post("/agent/task-runs/{task_run_id}/heartbeat", response_model=TaskRunRead)
@@ -476,3 +652,129 @@ def upload_artifact(
 ) -> dict:
     artifact = store_artifact(db, storage, task_id, task_run_id, kind, file)
     return {"artifact_id": artifact.id, "file_path": artifact.file_path}
+
+
+# ---- Organization routes ----
+@app.get("/organizations", response_model=list[OrganizationRead])
+def list_orgs(db: Session = Depends(get_db)) -> list[Organization]:
+    return list_organizations(db)
+
+@app.get("/organizations/{org_id}", response_model=OrganizationRead)
+def get_org(org_id: int, db: Session = Depends(get_db)) -> Organization:
+    return get_organization_or_404(db, org_id)
+
+@app.post("/organizations", response_model=OrganizationRead)
+def create_org(payload: OrganizationCreate, db: Session = Depends(get_db)) -> Organization:
+    creator_email = "admin@devboss.local"
+    return create_organization(db, payload.name, payload.slug, creator_email)
+
+@app.patch("/organizations/{org_id}", response_model=OrganizationRead)
+def patch_org(org_id: int, payload: OrganizationUpdate, db: Session = Depends(get_db)) -> Organization:
+    org = get_organization_or_404(db, org_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(org, field, value)
+    org.updated_at = datetime.now()
+    db.add(org)
+    db.commit()
+    return get_organization_or_404(db, org_id)
+
+@app.delete("/organizations/{org_id}")
+def delete_org(org_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    delete_organization_svc(db, org_id)
+    return {"deleted": True}
+
+@app.post("/organizations/{org_id}/members", response_model=OrganizationMemberRead)
+def add_member(org_id: int, payload: OrgMemberCreate, db: Session = Depends(get_db)) -> OrganizationMember:
+    return add_org_member(db, org_id, payload.user_email, payload.role)
+
+@app.delete("/organizations/{org_id}/members/{member_id}")
+def remove_member(org_id: int, member_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    remove_org_member(db, org_id, member_id)
+    return {"deleted": True}
+
+@app.patch("/organizations/{org_id}/members/{member_id}/role", response_model=OrganizationMemberRead)
+def patch_member_role(org_id: int, member_id: int, payload: OrgMemberCreate, db: Session = Depends(get_db)) -> OrganizationMember:
+    return update_org_member_role(db, org_id, member_id, payload.role)
+
+# ---- PRD routes ----
+@app.get("/prds", response_model=list[PRDRead])
+def list_prds_route(org_id: int | None = None, db: Session = Depends(get_db)) -> list[PRD]:
+    return list_prds(db, org_id)
+
+@app.get("/prds/{prd_id}", response_model=PRDRead)
+def get_prd(prd_id: int, db: Session = Depends(get_db)) -> PRD:
+    return get_prd_or_404(db, prd_id)
+
+@app.post("/prds", response_model=PRDRead)
+def create_prd_route(payload: PRDCreate, db: Session = Depends(get_db)) -> PRD:
+    return create_prd(db, payload.organization_id, payload.title, payload.summary, "admin@devboss.local")
+
+@app.patch("/prds/{prd_id}", response_model=PRDRead)
+def patch_prd(prd_id: int, payload: PRDUpdate, db: Session = Depends(get_db)) -> PRD:
+    return update_prd(db, prd_id, payload.model_dump(exclude_unset=True))
+
+@app.delete("/prds/{prd_id}")
+def delete_prd_route(prd_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    prd = get_prd_or_404(db, prd_id)
+    db.delete(prd)
+    db.commit()
+    return {"deleted": True}
+
+@app.post("/prds/{prd_id}/comments", response_model=PRDCommentRead)
+def create_prd_comment(prd_id: int, payload: PRDCommentCreate, db: Session = Depends(get_db)) -> PRDComment:
+    return add_prd_comment(db, prd_id, CommentAuthorType.HUMAN, "User", payload.body)
+
+@app.post("/prds/{prd_id}/chat", response_model=PRDCommentRead)
+def prd_chat(prd_id: int, payload: PRDChatMessage, db: Session = Depends(get_db)) -> PRDComment:
+    add_prd_comment(db, prd_id, CommentAuthorType.HUMAN, "User", payload.message)
+    prd = get_prd_or_404(db, prd_id)
+    context = "\n".join([f"{c.author_name}: {c.body}" for c in prd.comments])
+    reply = f"Thanks for your input. Here's what I've captured so far:\n\n---\n\n{prd.body_markdown or prd.summary or 'No content yet.'}\n\n---\n\nBased on your latest message: \"{payload.message}\"\n\nWhat would you like to refine or add next?"
+    return add_prd_comment(db, prd_id, CommentAuthorType.AGENT, "Dev Boss", reply)
+
+@app.patch("/prds/{prd_id}/body", response_model=PRDRead)
+def update_prd_body(prd_id: int, payload: PRDUpdate, db: Session = Depends(get_db)) -> PRD:
+    return update_prd(db, prd_id, {"body_markdown": payload.body_markdown})
+
+@app.post("/prds/{prd_id}/convert", response_model=list[TaskRead])
+def convert_prd(prd_id: int, payload: PRDConvertRequest, db: Session = Depends(get_db)) -> list[Task]:
+    tasks = convert_prd_to_tasks(db, prd_id, payload.project_ids, payload.task_titles)
+    return [get_task_or_404(db, t.id) for t in tasks]
+
+# ---- Token routes ----
+@app.post("/token-usage", response_model=TokenUsageRead)
+def create_token_usage(payload: TokenUsageCreate, db: Session = Depends(get_db)) -> TokenUsage:
+    return record_token_usage(db, None, payload.task_id, payload.task_run_id, payload.prd_id, payload.model, payload.tokens_in, payload.tokens_out, payload.cost_usd)
+
+@app.get("/projects/{project_id}/token-summary", response_model=TokenSummary)
+def project_token_summary(project_id: int, db: Session = Depends(get_db)) -> TokenSummary:
+    get_project_or_404(db, project_id)
+    return get_project_token_summary(db, project_id)
+
+@app.get("/tasks/{task_id}/token-summary", response_model=TokenSummary)
+def task_token_summary_route(task_id: int, db: Session = Depends(get_db)) -> TokenSummary:
+    get_task_or_404(db, task_id)
+    return get_task_token_summary(db, task_id)
+
+# ---- Tag routes ----
+@app.post("/tags", response_model=TagRead)
+def create_tag(payload: TagCreate, db: Session = Depends(get_db)) -> Tag:
+    return create_tag_svc(db, payload.organization_id, payload.name, payload.color)
+
+@app.get("/organizations/{org_id}/tags", response_model=list[TagRead])
+def list_org_tags(org_id: int, db: Session = Depends(get_db)) -> list[Tag]:
+    org = get_organization_or_404(db, org_id)
+    return org.tags
+
+@app.delete("/tags/{tag_id}")
+def delete_tag(tag_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    delete_tag_svc(db, tag_id)
+    return {"deleted": True}
+
+@app.patch("/tasks/{task_id}/tags", response_model=list[TagRead])
+def update_task_tags(task_id: int, payload: TaskTagsUpdate, db: Session = Depends(get_db)) -> list[Tag]:
+    return set_task_tags(db, task_id, payload.tag_ids)
+
+@app.patch("/prds/{prd_id}/tags", response_model=list[TagRead])
+def update_prd_tags(prd_id: int, payload: PRDTagsUpdate, db: Session = Depends(get_db)) -> list[Tag]:
+    return set_prd_tags(db, prd_id, payload.tag_ids)

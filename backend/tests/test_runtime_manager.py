@@ -13,7 +13,7 @@ def make_manager() -> DockerRuntimeManager:
     return DockerRuntimeManager(settings)
 
 
-def test_launch_engineer_sets_caveman_env_when_enabled(monkeypatch):
+def test_launch_engineer_sets_provider_env_vars(monkeypatch):
     manager = make_manager()
     monkeypatch.setattr(manager, "build_runtime_image", lambda image_name: None)
 
@@ -39,12 +39,20 @@ def test_launch_engineer_sets_caveman_env_when_enabled(monkeypatch):
 
     monkeypatch.setattr(manager, "_client", lambda: FakeClient())
 
-    engineer = SimpleNamespace(id=7, docker_image="devboss-engineer:latest", runtime_config={"caveman_enabled": True})
+    from app.enums import ModelProvider
+
+    engineer = SimpleNamespace(
+        id=7,
+        docker_image="devboss-engineer:latest",
+        model_provider=ModelProvider.DEEPSEEK,
+        model_name="deepseek-v4-pro",
+    )
     runtime = SimpleNamespace(id=11)
     container_name, container_id = manager.launch_engineer(
         engineer,
         runtime,
-        "{\"provider\":\"chatgpt\"}",
+        "sk-example-key",
+        "DEEPSEEK_API_KEY",
         "ghp_example",
         "",
         "",
@@ -55,10 +63,13 @@ def test_launch_engineer_sets_caveman_env_when_enabled(monkeypatch):
     assert container_id == "container-123"
     assert captured["removed_existing"] is True
     environment = captured["kwargs"]["environment"]
-    assert environment["DEVBOSS_CAVEMAN_ENABLED"] == "true"
+    assert environment["DEVBOSS_MODEL_PROVIDER"] == "deepseek"
+    assert environment["DEVBOSS_MODEL_NAME"] == "deepseek-v4-pro"
+    assert environment["DEEPSEEK_API_KEY"] == "sk-example-key"
+    assert "DEVBOSS_CAVEMAN_ENABLED" not in environment
 
 
-def test_launch_engineer_disables_caveman_env_by_default(monkeypatch):
+def test_launch_engineer_passes_github_and_aws_env(monkeypatch):
     manager = make_manager()
     monkeypatch.setattr(manager, "build_runtime_image", lambda image_name: None)
     fake_not_found = type("FakeNotFound", (Exception,), {})
@@ -79,17 +90,29 @@ def test_launch_engineer_disables_caveman_env_by_default(monkeypatch):
 
     monkeypatch.setattr(manager, "_client", lambda: FakeClient())
 
-    engineer = SimpleNamespace(id=8, docker_image="devboss-engineer:latest", runtime_config={})
+    from app.enums import ModelProvider
+
+    engineer = SimpleNamespace(
+        id=8,
+        docker_image="devboss-engineer:latest",
+        model_provider=ModelProvider.OPENAI,
+        model_name="gpt-5.4",
+    )
     runtime = SimpleNamespace(id=12)
     _container_name, _container_id = manager.launch_engineer(
         engineer,
         runtime,
-        "{\"provider\":\"chatgpt\"}",
-        "ghp_example",
-        "",
-        "",
-        "",
+        "sk-openai-key",
+        "OPENAI_API_KEY",
+        "ghp_example_token",
+        "AKID_EXAMPLE",
+        "secret_example",
+        "us-east-1",
     )
 
     environment = captured["kwargs"]["environment"]
-    assert environment["DEVBOSS_CAVEMAN_ENABLED"] == "false"
+    assert environment["OPENAI_API_KEY"] == "sk-openai-key"
+    assert environment["DEVBOSS_GITHUB_TOKEN"] == "ghp_example_token"
+    assert environment["AWS_ACCESS_KEY_ID"] == "AKID_EXAMPLE"
+    assert environment["AWS_SECRET_ACCESS_KEY"] == "secret_example"
+    assert environment["AWS_REGION"] == "us-east-1"

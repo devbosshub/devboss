@@ -159,7 +159,7 @@ def test_ready_to_deploy_requires_human_trigger_before_deployment_and_archives_a
         json={
             "outcome_type": "deployment_complete",
             "summary": "Task branch is pushed and a PR is ready for human merge.",
-            "branch_name": "codex/task-42",
+            "branch_name": "opencode/task-42",
             "pr_url": "https://github.com/acme/deployment-flow/pull/42",
             "deploy_url": None,
             "blocked_reason": None,
@@ -260,7 +260,7 @@ def test_release_queue_serializes_ready_to_deploy_and_deployment_per_project(cli
         json={
             "outcome_type": "deployment_complete",
             "summary": "PR is ready for merge.",
-            "branch_name": "codex/task-one",
+            "branch_name": "opencode/task-one",
             "pr_url": "https://github.com/acme/release-queue/pull/1",
             "deploy_url": None,
             "blocked_reason": None,
@@ -350,7 +350,7 @@ def test_manual_archive_from_deployment_stage_frees_release_queue(client, db_ses
         json={
             "outcome_type": "deployment_complete",
             "summary": "PR is ready for merge and deployment handoff.",
-            "branch_name": "codex/task-32",
+            "branch_name": "opencode/task-32",
             "pr_url": "https://github.com/acme/manual-archive/pull/32",
             "deploy_url": None,
             "blocked_reason": None,
@@ -417,7 +417,7 @@ def test_in_progress_outcome_ignores_pr_url_until_ready_to_deploy(client, db_ses
         json={
             "outcome_type": "build_complete",
             "summary": "Implementation is complete and branch is ready for AI testing.",
-            "branch_name": "codex/task-33",
+            "branch_name": "opencode/task-33",
             "pr_url": "https://github.com/acme/pr-guard/pull/33",
             "deploy_url": None,
             "blocked_reason": None,
@@ -427,7 +427,7 @@ def test_in_progress_outcome_ignores_pr_url_until_ready_to_deploy(client, db_ses
 
     updated_task = client.get(f"/tasks/{task['id']}").json()
     assert updated_task["status"] == "ai_testing"
-    assert updated_task["branch_name"] == "codex/task-33"
+    assert updated_task["branch_name"] == "opencode/task-33"
     assert updated_task["pr_url"] is None
 
 
@@ -462,10 +462,10 @@ def test_engineer_launch_stop_and_health_ping(client):
     client.post(
         "/settings",
         json={
-            "key": "codex_auth_json",
-            "value": "{\"provider\":\"chatgpt\",\"token\":\"example\"}",
+            "key": "deepseek_api_key",
+            "value": "sk-deepseek-example",
             "is_secret": True,
-            "description": "Codex auth file content",
+            "description": "DeepSeek API key for opencode",
         },
     )
     client.post(
@@ -483,13 +483,15 @@ def test_engineer_launch_stop_and_health_ping(client):
             self,
             engineer_record,
             runtime_record,
-            codex_auth_json,
+            provider_api_key,
+            provider_env_var,
             github_token,
             aws_access_key_id,
             aws_secret_access_key,
             aws_region,
         ):
-            assert codex_auth_json == "{\"provider\":\"chatgpt\",\"token\":\"example\"}"
+            assert provider_api_key == "sk-deepseek-example"
+            assert provider_env_var == "DEEPSEEK_API_KEY"
             assert github_token == "ghp_example"
             assert aws_access_key_id == ""
             assert aws_secret_access_key == ""
@@ -538,10 +540,10 @@ def test_launch_engineer_reuses_latest_stopped_runtime(client, db_session):
     client.post(
         "/settings",
         json={
-            "key": "codex_auth_json",
-            "value": "{\"provider\":\"chatgpt\",\"token\":\"example\"}",
+            "key": "deepseek_api_key",
+            "value": "sk-deepseek-example",
             "is_secret": True,
-            "description": "Codex auth file content",
+            "description": "DeepSeek API key for opencode",
         },
     )
     client.post(
@@ -559,7 +561,8 @@ def test_launch_engineer_reuses_latest_stopped_runtime(client, db_session):
             self,
             engineer_record,
             runtime_record,
-            codex_auth_json,
+            provider_api_key,
+            provider_env_var,
             github_token,
             aws_access_key_id,
             aws_secret_access_key,
@@ -592,12 +595,11 @@ def test_delete_engineer_blocks_when_running_and_when_referenced(client):
             "name": "Delete Me",
             "template": "backend_engineer",
             "skill_markdown": "# Backend",
-            "model_name": "gpt-5.4",
+            "model_provider": "deepseek",
+            "model_name": "deepseek-v4-pro",
             "docker_image": "devboss-engineer:latest",
             "poll_interval_seconds": 30,
-            "enabled_tools": ["git"],
             "allowed_projects": [],
-            "runtime_config": {},
             "is_active": True,
         },
     )
@@ -609,7 +611,8 @@ def test_delete_engineer_blocks_when_running_and_when_referenced(client):
             self,
             engineer_record,
             runtime_record,
-            codex_auth_json,
+            provider_api_key,
+            provider_env_var,
             github_token,
             aws_access_key_id,
             aws_secret_access_key,
@@ -626,10 +629,10 @@ def test_delete_engineer_blocks_when_running_and_when_referenced(client):
         client.post(
             "/settings",
             json={
-                "key": "codex_auth_json",
-                "value": "{\"provider\":\"chatgpt\",\"token\":\"example\"}",
+                "key": "deepseek_api_key",
+                "value": "sk-deepseek-example",
                 "is_secret": True,
-                "description": "Codex auth file content",
+                "description": "DeepSeek API key for opencode",
             },
         )
         client.post(

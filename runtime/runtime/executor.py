@@ -18,7 +18,12 @@ Emit a single JSON object with keys:
 - blocked_reason
 
 Use outcome_type from:
-needs_human_input, grooming_complete, build_complete, testing_complete, deployment_complete, blocked, failed
+completed, needs_human_input, blocked, failed
+
+completed means the stage work is done successfully.
+needs_human_input means you need a decision or information from a human.
+blocked means there is an external blocker (missing API, config, etc).
+failed means a tooling or environment error occurred.
 
 Reply with only a single JSON object and no markdown fences.
 """.strip()
@@ -31,11 +36,11 @@ def _extract_json_object(output: str) -> dict:
     return json.loads(match.group(0))
 
 
-def run_codex(task_root: Path, codex_command: str, dry_run: bool) -> tuple[dict, str]:
+def run_opencode(task_root: Path, opencode_command: str, model: str, dry_run: bool) -> tuple[dict, str]:
     if dry_run:
         outcome = {
             "outcome_type": "needs_human_input",
-            "summary": "Dry-run mode is enabled. Replace with a live Codex CLI invocation to execute the task.",
+            "summary": "Dry-run mode is enabled. Replace with a live Opencode CLI invocation to execute the task.",
             "branch_name": None,
             "pr_url": None,
             "deploy_url": None,
@@ -50,17 +55,19 @@ def run_codex(task_root: Path, codex_command: str, dry_run: bool) -> tuple[dict,
         "Inspect the repository, follow the task files in this directory, act within the limits of the current stage, and then emit the JSON outcome."
     )
     command = [
-        codex_command,
-        "exec",
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
+        opencode_command,
+        "run",
+        "--model", model,
+        "--dangerously-skip-permissions",
+        "--format", "json",
+        "--dir", str(task_root),
         prompt,
     ]
     result = subprocess.run(command, cwd=task_root, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         outcome = {
             "outcome_type": "failed",
-            "summary": result.stderr or "Codex CLI execution failed",
+            "summary": result.stderr or "Opencode CLI execution failed",
             "branch_name": None,
             "pr_url": None,
             "deploy_url": None,
@@ -72,7 +79,7 @@ def run_codex(task_root: Path, codex_command: str, dry_run: bool) -> tuple[dict,
     except json.JSONDecodeError:
         outcome = {
             "outcome_type": "failed",
-            "summary": f"Codex output was not valid JSON.\n{result.stdout}",
+            "summary": f"Opencode output was not valid JSON.\n{result.stdout}",
             "branch_name": None,
             "pr_url": None,
             "deploy_url": None,

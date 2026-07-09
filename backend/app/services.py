@@ -6,15 +6,49 @@ from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.enums import ArtifactKind, CommentAuthorType, EngineerRuntimeStatus, OutcomeType, RunPhase, RunStatus, TaskStatus
-from app.models import ConfigSetting, Engineer, EngineerRuntime, EvidenceArtifact, Project, Task, TaskComment, TaskRun
-from app.schemas import AgentOutcome, TaskCommentCreate, TaskCreate, TaskUpdate
+from app.enums import (
+    ArtifactKind,
+    CommentAuthorType,
+    EngineerRuntimeStatus,
+    MembershipRole,
+    OutcomeType,
+    PRDStatus,
+    RunPhase,
+    RunStatus,
+    StatusGroup,
+    TaskStatus,
+)
+from app.models import (
+    ConfigSetting,
+    Engineer,
+    EngineerRuntime,
+    EvidenceArtifact,
+    Organization,
+    OrganizationMember,
+    PRD,
+    PRDComment,
+    Project,
+    Tag,
+    Task,
+    TaskComment,
+    TaskRun,
+    TokenUsage,
+    User,
+    Workflow,
+    WorkflowStage,
+)
+from app.schemas import AgentOutcome, TaskCommentCreate, TaskCreate, TaskUpdate, TokenSummary
 from app.storage import LocalArtifactStorage
 from app.workflow import (
     OUTCOME_TO_STATUS,
+    advance_task,
+    advance_task_to_stage,
     can_transition,
     execution_status_for_phase,
+    get_first_stage,
+    get_rework_stage,
     is_allowed_outcome_for_status,
+    is_allowed_stage_outcome,
     required_phase_for_status,
 )
 
@@ -27,7 +61,6 @@ MAX_TESTING_REWORK_LOOPS = 3
 RELEASE_TASK_STATUSES = {TaskStatus.READY_TO_DEPLOY, TaskStatus.DEPLOYED}
 ACTIVE_RELEASE_RUN_STATUSES = {RunStatus.PENDING, RunStatus.CLAIMED, RunStatus.RUNNING, RunStatus.WAITING_HUMAN}
 PR_URL_ALLOWED_STATUSES = {TaskStatus.READY_TO_DEPLOY, TaskStatus.DEPLOYED}
-
 
 PROMPT_DIRECTORY = Path(__file__).resolve().parent / "prompts"
 STAGE_PROMPT_FILES = {
@@ -45,8 +78,80 @@ def load_stage_instructions(task_status: TaskStatus) -> str:
         return ""
     prompt_path = PROMPT_DIRECTORY / file_name
     if not prompt_path.exists():
-        raise HTTPException(status_code=500, detail=f"Missing stage prompt file for status '{task_status.value}'")
+        return ""
     return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def get_workflow_or_404(db: Session, workflow_id: int) -> Workflow:
+    workflow = db.scalar(
+        select(Workflow)
+        .options(selectinload(Workflow.stages))
+        .where(Workflow.id == workflow_id)
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow
+
+
+def get_workflow_stage_or_404(db: Session, stage_id: int) -> WorkflowStage:
+    stage = db.get(WorkflowStage, stage_id)
+    if not stage:
+        raise HTTPException(status_code=404, detail="Workflow stage not found")
+    return stage
+
+
+def list_workflows(db: Session) -> list[Workflow]:
+    return list(
+        db.scalars(
+            select(Workflow)
+            .options(selectinload(Workflow.stages))
+            .order_by(Workflow.created_at.asc())
+        )
+    )
+
+
+def create_workflow_stage(db: Session, workflow_id: int, stage_data: dict) -> WorkflowStage:
+    workflow = get_workflow_or_404(db, workflow_id)
+    if stage_data.get("stage_order") is None:
+        max_order = 0
+        if workflow.stages:
+            max_order = max(s.stage_order for s in workflow.stages)
+        stage_data["stage_order"] = max_order + 1
+    stage = WorkflowStage(workflow_id=workflow_id, **stage_data)
+    db.add(stage)
+    db.commit()
+    db.refresh(stage)
+    return stage
+
+
+def update_workflow_stage(db: Session, stage_id: int, updates: dict) -> WorkflowStage:
+    stage = get_workflow_stage_or_404(db, stage_id)
+    for field, value in updates.items():
+        setattr(stage, field, value)
+    stage.updated_at = utcnow()
+    db.add(stage)
+    db.commit()
+    db.refresh(stage)
+    return stage
+
+
+def delete_workflow_stage(db: Session, stage_id: int) -> None:
+    stage = get_workflow_stage_or_404(db, stage_id)
+    db.delete(stage)
+    db.commit()
+
+
+def reorder_workflow_stages(db: Session, workflow_id: int, stage_orders: list[dict]) -> list[WorkflowStage]:
+    get_workflow_or_404(db, workflow_id)
+    for item in stage_orders:
+        stage = db.get(WorkflowStage, item["id"])
+        if stage and stage.workflow_id == workflow_id:
+            stage.stage_order = item["stage_order"]
+            stage.updated_at = utcnow()
+            db.add(stage)
+    db.commit()
+    workflow = get_workflow_or_404(db, workflow_id)
+    return workflow.stages
 
 
 def get_project_or_404(db: Session, project_id: int) -> Project:
@@ -195,6 +300,7 @@ def get_task_or_404(db: Session, task_id: int) -> Task:
             selectinload(Task.comments),
             selectinload(Task.task_runs),
             selectinload(Task.artifacts),
+            selectinload(Task.current_stage),
         )
         .where(Task.id == task_id)
     )
@@ -218,6 +324,7 @@ def list_tasks_by_status(db: Session, project_id: int | None = None) -> list[Tas
             selectinload(Task.comments),
             selectinload(Task.task_runs),
             selectinload(Task.artifacts),
+            selectinload(Task.current_stage),
         )
         .order_by(Task.updated_at.desc())
     )
@@ -239,6 +346,7 @@ def list_attention_tasks(db: Session) -> list[Task]:
         if task.blocked_reason
         or any(comment.action_required for comment in task.comments)
         or task.status in attention_statuses
+        or task.status_group in {StatusGroup.WAITING_APPROVAL, StatusGroup.BLOCKED}
     ]
 
 
@@ -268,12 +376,20 @@ def release_queue_head_task_id(db: Session, project_id: int) -> int | None:
 
 
 def create_task(db: Session, payload: TaskCreate) -> Task:
-    get_project_or_404(db, payload.project_id)
+    project = get_project_or_404(db, payload.project_id)
     if payload.assigned_engineer_id is not None:
         get_engineer_or_404(db, payload.assigned_engineer_id)
     task = Task(**payload.model_dump())
     if task.status in RELEASE_TASK_STATUSES and task.release_queue_entered_at is None:
         task.release_queue_entered_at = utcnow()
+
+    if project.workflow_id and not task.workflow_stage_id:
+        first_stage = get_first_stage(db, project.workflow_id)
+        if first_stage:
+            task.workflow_stage_id = first_stage.id
+            if first_stage.assigned_engineer_id:
+                task.assigned_engineer_id = first_stage.assigned_engineer_id
+
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -316,12 +432,37 @@ def add_comment(db: Session, task_id: int, payload: TaskCommentCreate) -> TaskCo
             latest_run.heartbeat_at = utcnow()
             latest_run.updated_at = utcnow()
             db.add(latest_run)
+            task.status_group = StatusGroup.TODO
     db.commit()
     db.refresh(comment)
     return comment
 
 
 def maybe_create_task_run(db: Session, task: Task) -> Task | None:
+    stage = task.current_stage
+    if stage and stage.is_ai_executable and stage.assigned_engineer_id:
+        task.assigned_engineer_id = stage.assigned_engineer_id
+        open_run = db.scalar(
+            select(TaskRun).where(
+                TaskRun.task_id == task.id,
+                TaskRun.workflow_stage_id == stage.id,
+                TaskRun.status.in_([RunStatus.PENDING, RunStatus.CLAIMED, RunStatus.RUNNING, RunStatus.WAITING_HUMAN]),
+            )
+        )
+        if open_run:
+            return task
+        phase = required_phase_for_status(task.status) or RunPhase.BUILD
+        run = TaskRun(
+            task_id=task.id,
+            engineer_id=stage.assigned_engineer_id,
+            phase=phase,
+            workflow_stage_id=stage.id,
+            status=RunStatus.PENDING,
+        )
+        db.add(run)
+        db.commit()
+        return task
+
     phase = required_phase_for_status(task.status)
     if phase is None or task.assigned_engineer_id is None:
         return None
@@ -345,6 +486,19 @@ def approve_task_run(db: Session, task_run_id: int, summary: str | None = None) 
     if not task_run:
         raise HTTPException(status_code=404, detail="Task run not found")
     task = get_task_or_404(db, task_run.task_id)
+
+    if task.current_stage and task.status_group == StatusGroup.WAITING_APPROVAL:
+        task.status_group = StatusGroup.TODO
+        if summary:
+            task_run.summary = summary
+        db.add(task)
+        db.add(task_run)
+        db.commit()
+        advance_task(db, task)
+        maybe_create_task_run(db, task)
+        db.refresh(task_run)
+        return task_run
+
     if task.status == TaskStatus.AI_GROOMING:
         next_status = TaskStatus.READY_FOR_BUILD
     elif task.status == TaskStatus.READY_FOR_BUILD:
@@ -391,8 +545,49 @@ def latest_task_run_for_task(task: Task) -> TaskRun | None:
 
 def retry_task(db: Session, task_id: int) -> Task:
     task = get_task_or_404(db, task_id)
-    if task.assigned_engineer_id is None:
+    if task.assigned_engineer_id is None and (not task.current_stage or not task.current_stage.assigned_engineer_id):
         raise HTTPException(status_code=400, detail="Assign an engineer before retrying this task")
+
+    if task.current_stage:
+        target_stage_id = task.workflow_stage_id
+        engineer_id = task.current_stage.assigned_engineer_id or task.assigned_engineer_id
+        open_run = db.scalar(
+            select(TaskRun).where(
+                TaskRun.task_id == task.id,
+                TaskRun.workflow_stage_id == target_stage_id,
+                TaskRun.status.in_([RunStatus.PENDING, RunStatus.CLAIMED, RunStatus.RUNNING, RunStatus.WAITING_HUMAN]),
+            )
+        )
+        if open_run:
+            open_run.status = RunStatus.PENDING
+            open_run.summary = "Re-queued by human."
+            open_run.outcome_type = None
+            open_run.outcome_payload_json = None
+            open_run.claimed_by_runtime_id = None
+            open_run.claimed_at = None
+            open_run.started_at = None
+            open_run.completed_at = None
+            open_run.heartbeat_at = utcnow()
+            open_run.updated_at = utcnow()
+            open_run.attempt_number = (open_run.attempt_number or 1) + 1
+            db.add(open_run)
+        else:
+            phase = RunPhase.BUILD
+            db.add(TaskRun(
+                task_id=task.id,
+                engineer_id=engineer_id,
+                phase=phase,
+                workflow_stage_id=target_stage_id,
+                status=RunStatus.PENDING,
+                attempt_number=1,
+            ))
+        task.status_group = StatusGroup.TODO
+        task.rework_count = 0
+        task.blocked_reason = None
+        task.updated_at = utcnow()
+        db.add(task)
+        db.commit()
+        return get_task_or_404(db, task.id)
 
     target_phase = required_phase_for_status(task.status)
     if target_phase is None:
@@ -443,28 +638,50 @@ def poll_next_task(db: Session, runtime_id: int) -> tuple[TaskRun | None, Task |
         db.add(runtime)
         db.commit()
 
+    assigned_stage_ids_subq = (
+        select(WorkflowStage.id)
+        .where(WorkflowStage.assigned_engineer_id == engineer.id)
+        .scalar_subquery()
+    )
+
     stmt = (
         select(TaskRun)
         .options(selectinload(TaskRun.task))
-        .join(Task)
         .where(
-            TaskRun.engineer_id == engineer.id,
             TaskRun.status == RunStatus.PENDING,
-            Task.status.in_(
-                [
-                    TaskStatus.AI_GROOMING,
-                    TaskStatus.IN_PROGRESS,
-                    TaskStatus.AI_TESTING,
-                    TaskStatus.READY_TO_DEPLOY,
-                    TaskStatus.DEPLOYED,
-                ]
-            ),
+            TaskRun.workflow_stage_id.in_(assigned_stage_ids_subq),
         )
         .order_by(TaskRun.created_at.asc())
     )
+
     if db.bind and db.bind.dialect.name == "postgresql":
         stmt = stmt.with_for_update(skip_locked=True)
     task_runs = list(db.scalars(stmt))
+
+    if not task_runs:
+        stmt = (
+            select(TaskRun)
+            .options(selectinload(TaskRun.task))
+            .join(Task)
+            .where(
+                TaskRun.engineer_id == engineer.id,
+                TaskRun.status == RunStatus.PENDING,
+                Task.status.in_(
+                    [
+                        TaskStatus.AI_GROOMING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.AI_TESTING,
+                        TaskStatus.READY_TO_DEPLOY,
+                        TaskStatus.DEPLOYED,
+                    ]
+                ),
+            )
+            .order_by(TaskRun.created_at.asc())
+        )
+        if db.bind and db.bind.dialect.name == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        task_runs = list(db.scalars(stmt))
+
     if not task_runs:
         return None, None, runtime
     task_run = None
@@ -495,6 +712,10 @@ def poll_next_task(db: Session, runtime_id: int) -> tuple[TaskRun | None, Task |
         db.add(task)
         db.commit()
         task = get_task_or_404(db, task_run.task_id)
+    task.status_group = StatusGroup.IN_PROGRESS
+    task.updated_at = utcnow()
+    db.add(task)
+    db.commit()
     return task_run, task, runtime
 
 
@@ -572,19 +793,19 @@ def apply_agent_outcome(db: Session, task_run_id: int, payload: AgentOutcome) ->
     if not task_run:
         raise HTTPException(status_code=404, detail="Task run not found")
     task = get_task_or_404(db, task_run.task_id)
-    if not is_allowed_outcome_for_status(task.status, payload.outcome_type):
-        allowed = sorted(
-            outcome.value
-            for outcome in OUTCOME_TO_STATUS
-            if is_allowed_outcome_for_status(task.status, outcome)
-        )
+
+    stage = task.current_stage
+    if stage:
+        outcome_ok = is_allowed_stage_outcome(payload.outcome_type)
+    else:
+        outcome_ok = is_allowed_outcome_for_status(task.status, payload.outcome_type)
+
+    if not outcome_ok:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Outcome '{payload.outcome_type.value}' is not valid for task status '{task.status.value}'. "
-                f"Allowed outcomes: {', '.join(allowed)}"
-            ),
+            detail=f"Outcome '{payload.outcome_type.value}' is not valid for this task stage.",
         )
+
     task_run.outcome_type = payload.outcome_type
     task_run.summary = payload.summary
     task_run.outcome_payload_json = payload.model_dump(mode="json")
@@ -607,6 +828,84 @@ def apply_agent_outcome(db: Session, task_run_id: int, payload: AgentOutcome) ->
     elif payload.outcome_type not in {OutcomeType.BLOCKED, OutcomeType.FAILED}:
         task.blocked_reason = None
 
+    if stage:
+        return _apply_stage_outcome(db, task, task_run, payload)
+    else:
+        return _apply_status_outcome(db, task, task_run, payload)
+
+
+def _apply_stage_outcome(db: Session, task: Task, task_run: TaskRun, payload: AgentOutcome) -> TaskRun:
+    stage = task.current_stage
+    if not stage:
+        raise HTTPException(status_code=500, detail="No current stage")
+
+    if payload.outcome_type == OutcomeType.COMPLETED:
+        task_run.status = RunStatus.COMPLETED
+        task_run.completed_at = utcnow()
+        advance_task(db, task)
+        task.updated_at = utcnow()
+        db.add(task)
+        db.add(task_run)
+        db.commit()
+        maybe_create_task_run(db, task)
+        db.refresh(task_run)
+        return task_run
+
+    if payload.outcome_type in {OutcomeType.BLOCKED, OutcomeType.FAILED}:
+        rework_count = task.rework_count + 1
+        max_attempts = stage.max_rework_attempts or 3
+        rework_target = get_rework_stage(db, stage)
+
+        if rework_count < max_attempts and rework_target:
+            task.rework_count = rework_count
+            advance_task_to_stage(db, task, rework_target)
+            task_run.status = RunStatus.COMPLETED
+            task_run.completed_at = utcnow()
+            add_task_comment(
+                db, task.id, CommentAuthorType.AGENT, "engineer-runtime",
+                f"Stage '{stage.name}' failed. Rework #{rework_count} — sending back to '{rework_target.name}'.",
+                action_required=False,
+            )
+            db.add(task)
+            db.add(task_run)
+            db.commit()
+            maybe_create_task_run(db, task)
+            db.refresh(task_run)
+            return task_run
+
+        task.status_group = StatusGroup.BLOCKED
+        task_run.status = RunStatus.WAITING_HUMAN
+        task.blocked_reason = payload.blocked_reason or payload.summary
+        add_task_comment(
+            db, task.id, CommentAuthorType.AGENT, "engineer-runtime",
+            f"Stage '{stage.name}' failed after {rework_count} attempts. Human input needed.",
+            action_required=True,
+        )
+        db.add(task)
+        db.add(task_run)
+        db.commit()
+        db.refresh(task_run)
+        return task_run
+
+    if payload.outcome_type == OutcomeType.NEEDS_HUMAN_INPUT:
+        task.status_group = StatusGroup.WAITING_APPROVAL
+        task_run.status = RunStatus.WAITING_HUMAN
+        db.add(task)
+        db.add(task_run)
+        db.commit()
+        db.refresh(task_run)
+        return task_run
+
+    task_run.status = RunStatus.FAILED
+    task.status_group = StatusGroup.BLOCKED
+    db.add(task)
+    db.add(task_run)
+    db.commit()
+    db.refresh(task_run)
+    return task_run
+
+
+def _apply_status_outcome(db: Session, task: Task, task_run: TaskRun, payload: AgentOutcome) -> TaskRun:
     if task.status == TaskStatus.AI_TESTING and payload.outcome_type in {OutcomeType.BLOCKED, OutcomeType.FAILED}:
         loop_number = task.testing_rework_count + 1
         if task.testing_rework_count < MAX_TESTING_REWORK_LOOPS:
@@ -617,27 +916,8 @@ def apply_agent_outcome(db: Session, task_run_id: int, payload: AgentOutcome) ->
             task_run.completed_at = utcnow()
             task_run.summary = payload.summary
             add_task_comment(
-                db,
-                task.id,
-                CommentAuthorType.AGENT,
-                "ai-testing",
-                "\n".join(
-                    [
-                        "## AI Testing Feedback",
-                        "",
-                        f"AI testing found issues that need code changes. Sending the task back to **In Progress** for another implementation pass.",
-                        "",
-                        f"**Loop:** {loop_number} of {MAX_TESTING_REWORK_LOOPS}",
-                        "",
-                        "### Summary",
-                        "",
-                        payload.summary,
-                        "",
-                        "### Fix Guidance",
-                        "",
-                        payload.blocked_reason or "Review the latest testing findings and address the failing behavior before running AI testing again.",
-                    ]
-                ),
+                db, task.id, CommentAuthorType.AGENT, "ai-testing",
+                f"AI testing found issues. Sending the task back to In Progress (loop {loop_number}/{MAX_TESTING_REWORK_LOOPS}).",
                 action_required=False,
             )
             db.add(task)
@@ -651,28 +931,8 @@ def apply_agent_outcome(db: Session, task_run_id: int, payload: AgentOutcome) ->
         task_run.summary = payload.summary
         task.blocked_reason = payload.blocked_reason or payload.summary
         add_task_comment(
-            db,
-            task.id,
-            CommentAuthorType.AGENT,
-            "ai-testing",
-            "\n".join(
-                [
-                    "## Human Input Needed",
-                    "",
-                    f"AI testing has already sent this task back for fixes **{MAX_TESTING_REWORK_LOOPS} times**.",
-                    "The task is now paused for human review before another attempt.",
-                    "",
-                    "### Latest Testing Summary",
-                    "",
-                    payload.summary,
-                    "",
-                    "### Reason For Pause",
-                    "",
-                    payload.blocked_reason or "Too many automated implementation-testing loops without a passing result.",
-                    "",
-                    "Please review the task thread and reply with guidance before retrying the task.",
-                ]
-            ),
+            db, task.id, CommentAuthorType.AGENT, "ai-testing",
+            f"AI testing exhausted {MAX_TESTING_REWORK_LOOPS} rework attempts. Human input needed. Summary: {payload.summary}",
             action_required=True,
         )
         db.add(task)
@@ -790,9 +1050,15 @@ def build_task_bundle(task: Task, project: Project, engineer: Engineer) -> dict:
         ),
         "ATTACHMENTS": [artifact.file_path for artifact in task.artifacts],
     }
-    stage_instructions = load_stage_instructions(task.status)
-    if stage_instructions:
-        bundle["STAGE_INSTRUCTIONS.md"] = stage_instructions
+
+    stage = task.current_stage
+    if stage and stage.stage_instructions:
+        bundle["STAGE_INSTRUCTIONS.md"] = stage.stage_instructions
+    else:
+        stage_instructions = load_stage_instructions(task.status)
+        if stage_instructions:
+            bundle["STAGE_INSTRUCTIONS.md"] = stage_instructions
+
     return bundle
 
 
@@ -928,6 +1194,155 @@ def mark_engineer_runtime_stopped(db: Session, runtime: EngineerRuntime, message
     db.refresh(runtime)
     return runtime
 
+
+# ---- Organization services ----
+def get_organization_or_404(db: Session, org_id: int) -> Organization:
+    org = db.scalar(select(Organization).options(selectinload(Organization.members).selectinload(OrganizationMember.user), selectinload(Organization.tags)).where(Organization.id == org_id))
+    if not org: raise HTTPException(status_code=404, detail="Organization not found")
+    return org
+
+def get_or_create_user(db: Session, email: str, external_id: int | None = None, name: str | None = None) -> User:
+    user = db.scalar(select(User).where(User.email == email))
+    if user: return user
+    user = User(email=email, external_id=external_id, name=name)
+    db.add(user); db.commit(); db.refresh(user)
+    return user
+
+def list_organizations(db: Session) -> list[Organization]:
+    return list(db.scalars(select(Organization).options(selectinload(Organization.tags)).order_by(Organization.created_at.asc())))
+
+def create_organization(db: Session, name: str, slug: str, creator_email: str) -> Organization:
+    existing = db.scalar(select(Organization).where((Organization.name == name) | (Organization.slug == slug)))
+    if existing: raise HTTPException(status_code=400, detail="Organization with this name or slug already exists")
+    org = Organization(name=name, slug=slug)
+    db.add(org); db.flush()
+    user = get_or_create_user(db, creator_email)
+    member = OrganizationMember(organization_id=org.id, user_id=user.id, role=MembershipRole.ADMIN)
+    db.add(member)
+    db.commit()
+    return get_organization_or_404(db, org.id)
+
+def archive_organization(db: Session, org_id: int) -> None:
+    org = get_organization_or_404(db, org_id)
+    for project in org.projects:
+        project.organization_id = None; db.add(project)
+    db.delete(org); db.commit()
+
+def add_org_member(db: Session, org_id: int, user_email: str, role: MembershipRole) -> OrganizationMember:
+    get_organization_or_404(db, org_id)
+    user = get_or_create_user(db, user_email)
+    existing = db.scalar(select(OrganizationMember).where(OrganizationMember.organization_id == org_id, OrganizationMember.user_id == user.id))
+    if existing: raise HTTPException(status_code=400, detail="User is already a member")
+    member = OrganizationMember(organization_id=org_id, user_id=user.id, role=role)
+    db.add(member); db.commit(); db.refresh(member)
+    return db.scalar(select(OrganizationMember).options(selectinload(OrganizationMember.user)).where(OrganizationMember.id == member.id))
+
+def remove_org_member(db: Session, org_id: int, member_id: int) -> None:
+    member = db.scalar(select(OrganizationMember).where(OrganizationMember.id == member_id, OrganizationMember.organization_id == org_id))
+    if not member: raise HTTPException(status_code=404, detail="Member not found")
+    db.delete(member); db.commit()
+
+def update_org_member_role(db: Session, org_id: int, member_id: int, role: MembershipRole) -> OrganizationMember:
+    member = db.scalar(select(OrganizationMember).where(OrganizationMember.id == member_id, OrganizationMember.organization_id == org_id))
+    if not member: raise HTTPException(status_code=404, detail="Member not found")
+    member.role = role; db.add(member); db.commit(); db.refresh(member)
+    return db.scalar(select(OrganizationMember).options(selectinload(OrganizationMember.user)).where(OrganizationMember.id == member.id))
+
+# ---- PRD services ----
+def get_prd_or_404(db: Session, prd_id: int) -> PRD:
+    prd = db.scalar(select(PRD).options(selectinload(PRD.comments), selectinload(PRD.tags)).where(PRD.id == prd_id))
+    if not prd: raise HTTPException(status_code=404, detail="PRD not found")
+    return prd
+
+def list_prds(db: Session, org_id: int | None = None) -> list[PRD]:
+    stmt = select(PRD).options(selectinload(PRD.comments), selectinload(PRD.tags)).order_by(PRD.updated_at.desc())
+    if org_id: stmt = stmt.where(PRD.organization_id == org_id)
+    return list(db.scalars(stmt))
+
+def create_prd(db: Session, org_id: int, title: str, summary: str | None, user_email: str) -> PRD:
+    get_organization_or_404(db, org_id)
+    user = get_or_create_user(db, user_email)
+    prd = PRD(organization_id=org_id, title=title, summary=summary, created_by_user_id=user.id)
+    db.add(prd); db.commit(); db.refresh(prd)
+    return get_prd_or_404(db, prd.id)
+
+def update_prd(db: Session, prd_id: int, updates: dict) -> PRD:
+    prd = get_prd_or_404(db, prd_id)
+    for field, value in updates.items(): setattr(prd, field, value)
+    prd.updated_at = utcnow()
+    db.add(prd); db.commit(); db.refresh(prd)
+    return get_prd_or_404(db, prd.id)
+
+def add_prd_comment(db: Session, prd_id: int, author_type: CommentAuthorType, author_name: str, body: str) -> PRDComment:
+    get_prd_or_404(db, prd_id)
+    comment = PRDComment(prd_id=prd_id, author_type=author_type, author_name=author_name, body=body)
+    db.add(comment); db.commit(); db.refresh(comment)
+    return comment
+
+def convert_prd_to_tasks(db: Session, prd_id: int, project_ids: list[int], task_titles: list[str]) -> list[Task]:
+    prd = get_prd_or_404(db, prd_id)
+    if len(task_titles) != len(project_ids): raise HTTPException(status_code=400, detail="task_titles and project_ids must match in length")
+    tasks = []
+    for i, title in enumerate(task_titles):
+        pid = project_ids[i]
+        get_project_or_404(db, pid)
+        task = create_task(db, TaskCreate(project_id=pid, title=title, requirement_markdown=prd.body_markdown or prd.summary or "", acceptance_criteria=f"From PRD: {prd.title}\n\n{prd.summary or ''}"))
+        tasks.append(task)
+    prd.status = PRDStatus.CONVERTED; db.add(prd); db.commit()
+    return tasks
+
+# ---- Token usage ----
+def record_token_usage(db: Session, user_id: int | None, task_id: int | None, task_run_id: int | None, prd_id: int | None, model: str, tokens_in: int, tokens_out: int, cost_usd: float) -> TokenUsage:
+    usage = TokenUsage(user_id=user_id, task_id=task_id, task_run_id=task_run_id, prd_id=prd_id, model=model, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost_usd)
+    db.add(usage); db.commit(); db.refresh(usage)
+    return usage
+
+def get_project_token_summary(db: Session, project_id: int) -> TokenSummary:
+    task_ids = db.scalars(select(Task.id).where(Task.project_id == project_id)).all()
+    usages = db.scalars(select(TokenUsage).where(TokenUsage.task_id.in_(task_ids))).all() if task_ids else []
+    total_in = sum(u.tokens_in for u in usages)
+    total_out = sum(u.tokens_out for u in usages)
+    total_cost = sum(u.cost_usd for u in usages)
+    return TokenSummary(total_tokens_in=total_in, total_tokens_out=total_out, total_cost_usd=total_cost)
+
+def get_task_token_summary(db: Session, task_id: int) -> TokenSummary:
+    usages = db.scalars(select(TokenUsage).where(TokenUsage.task_id == task_id)).all()
+    total_in = sum(u.tokens_in for u in usages)
+    total_out = sum(u.tokens_out for u in usages)
+    total_cost = sum(u.cost_usd for u in usages)
+    return TokenSummary(total_tokens_in=total_in, total_tokens_out=total_out, total_cost_usd=total_cost)
+
+# ---- Tag services ----
+def get_tag_or_404(db: Session, tag_id: int) -> Tag:
+    tag = db.get(Tag, tag_id)
+    if not tag: raise HTTPException(status_code=404, detail="Tag not found")
+    return tag
+
+def create_tag(db: Session, org_id: int, name: str, color: str | None) -> Tag:
+    get_organization_or_404(db, org_id)
+    existing = db.scalar(select(Tag).where(Tag.organization_id == org_id, Tag.name == name))
+    if existing: raise HTTPException(status_code=400, detail="Tag with this name already exists in the organization")
+    tag = Tag(organization_id=org_id, name=name, color=color)
+    db.add(tag); db.commit(); db.refresh(tag)
+    return tag
+
+def delete_tag(db: Session, tag_id: int) -> None:
+    tag = get_tag_or_404(db, tag_id)
+    db.delete(tag); db.commit()
+
+def set_task_tags(db: Session, task_id: int, tag_ids: list[int]) -> list[Tag]:
+    task = get_task_or_404(db, task_id)
+    tags = db.scalars(select(Tag).where(Tag.id.in_(tag_ids))).all() if tag_ids else []
+    task.tags = tags
+    db.add(task); db.commit(); db.refresh(task)
+    return task.tags
+
+def set_prd_tags(db: Session, prd_id: int, tag_ids: list[int]) -> list[Tag]:
+    prd = get_prd_or_404(db, prd_id)
+    tags = db.scalars(select(Tag).where(Tag.id.in_(tag_ids))).all() if tag_ids else []
+    prd.tags = tags
+    db.add(prd); db.commit(); db.refresh(prd)
+    return prd.tags
 
 def record_engineer_runtime_heartbeat(
     db: Session,

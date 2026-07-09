@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import { BoardLane } from "@/lib/types";
+import { BoardLane, WorkflowStage } from "@/lib/types";
 
 const ARCHIVED_PAGE_SIZE = 3;
 
@@ -19,25 +19,37 @@ const statusLabel: Record<string, string> = {
   archived: "Archived"
 };
 
-export function TaskBoard({ lanes }: { lanes: BoardLane[] }) {
+export function TaskBoard({ lanes, stages }: { lanes: BoardLane[]; stages?: WorkflowStage[] }) {
   const [visibleArchivedCount, setVisibleArchivedCount] = useState(ARCHIVED_PAGE_SIZE);
 
   useEffect(() => {
     setVisibleArchivedCount(ARCHIVED_PAGE_SIZE);
   }, [lanes]);
 
+  const stageLabelMap = new Map<number, string>();
+  if (stages) {
+    for (const stage of stages) {
+      stageLabelMap.set(stage.id, stage.name);
+    }
+  }
+
   return (
     <div className="board-scroll">
       <div className="board">
-        {lanes.map((lane) => {
+        {lanes.map((lane, laneIndex) => {
           const isArchivedLane = lane.status === "archived";
           const visibleTasks = isArchivedLane ? lane.tasks.slice(0, visibleArchivedCount) : lane.tasks;
           const remainingArchivedCount = isArchivedLane ? Math.max(lane.tasks.length - visibleTasks.length, 0) : 0;
 
+          let laneLabel = statusLabel[lane.status] || lane.status;
+          if (stages && stages[laneIndex]) {
+            laneLabel = stages[laneIndex].name;
+          }
+
           return (
-            <section className="lane" key={lane.status}>
+            <section className="lane" key={`${lane.status}-${laneIndex}`}>
               <div className="lane-header">
-                <h3>{statusLabel[lane.status]}</h3>
+                <h3>{laneLabel}</h3>
                 <span className="tag">{lane.tasks.length}</span>
               </div>
               <div className="lane-body">

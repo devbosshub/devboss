@@ -7,7 +7,7 @@ import { LayoutShell } from "@/components/layout-shell";
 import { ProjectBoardHeader } from "@/components/project-board-header";
 import { TaskBoard } from "@/components/task-board";
 import { api } from "@/lib/api";
-import { BoardResponse, Engineer, Project } from "@/lib/types";
+import { BoardResponse, Engineer, Project, Workflow, WorkflowStage } from "@/lib/types";
 
 function BoardPageContent() {
   const searchParams = useSearchParams();
@@ -15,6 +15,7 @@ function BoardPageContent() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [engineers, setEngineers] = useState<Engineer[]>([]);
   const [board, setBoard] = useState<BoardResponse | null>(null);
+  const [workflowStages, setWorkflowStages] = useState<WorkflowStage[]>([]);
   const projectId = Number(searchParams.get("projectId") ?? "");
 
   const loadBoard = (nextProjectId: number) => {
@@ -34,6 +35,11 @@ function BoardPageContent() {
         router.replace(`/board?projectId=${fallbackProjectId}`);
       }
       loadBoard(nextProjectId);
+
+      const activeProject = projectItems.find((p) => p.id === nextProjectId);
+      if (activeProject?.workflow_id) {
+        api.getWorkflow(activeProject.workflow_id).then((wf) => setWorkflowStages(wf.stages));
+      }
     });
   }, [projectId, router]);
 
@@ -92,7 +98,7 @@ function BoardPageContent() {
             <p className="muted">Task dashboard for this project. Switch projects from the dropdown above.</p>
           </div>
         </div>
-        <TaskBoard lanes={board?.lanes ?? []} />
+        <TaskBoard lanes={board?.lanes ?? []} stages={workflowStages.length > 0 ? workflowStages : undefined} />
       </section>
     </LayoutShell>
   );

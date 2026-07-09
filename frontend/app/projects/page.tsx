@@ -6,10 +6,11 @@ import { ConfirmModal } from "@/components/confirm-modal";
 import { LayoutShell } from "@/components/layout-shell";
 import { ProjectModal } from "@/components/project-modal";
 import { api } from "@/lib/api";
-import { Project } from "@/lib/types";
+import { Project, Workflow } from "@/lib/types";
 
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
 
   const loadProjects = () => {
@@ -18,6 +19,7 @@ export default function ProjectsPage() {
 
   useEffect(() => {
     loadProjects();
+    api.getWorkflows().then(setWorkflows);
   }, []);
 
   return (
@@ -29,7 +31,7 @@ export default function ProjectsPage() {
             <div className="muted" style={{ marginTop: 2 }}>Beta version</div>
           </div>
           <div className="topbar-actions">
-            <ProjectModal onSaved={loadProjects} triggerLabel="Add Project" />
+            <ProjectModal onSaved={loadProjects} triggerLabel="Add Project" workflows={workflows} />
           </div>
         </div>
       }
@@ -94,7 +96,7 @@ export default function ProjectsPage() {
                     </td>
                     <td className="action-cell">
                       <div className="table-actions">
-                        <ProjectModal onSaved={loadProjects} project={project} triggerClassName="button secondary" triggerLabel="Edit" />
+                        <ProjectModal onSaved={loadProjects} project={project} triggerClassName="button secondary" triggerLabel="Edit" workflows={workflows} />
                         <button className="button danger" onClick={() => setProjectToDelete(project)} type="button">
                           Delete
                         </button>

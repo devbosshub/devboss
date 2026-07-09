@@ -4,18 +4,20 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { ProjectForm } from "@/components/forms";
-import { Project } from "@/lib/types";
+import { Project, Workflow } from "@/lib/types";
 
 export function ProjectModal({
   project,
   triggerLabel,
   triggerClassName = "button",
   onSaved,
+  workflows,
 }: {
   project?: Project;
   triggerLabel: string;
   triggerClassName?: string;
   onSaved?: () => void | Promise<void>;
+  workflows?: Workflow[];
 }) {
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -57,6 +59,7 @@ export function ProjectModal({
                     await onSaved?.();
                   }}
                   project={project}
+                  workflows={workflows}
                 />
               </div>
             </div>,

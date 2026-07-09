@@ -1,313 +1,338 @@
 export const usageGuideMarkdown = `
-# Dev Boss Guide
+# Dev Boss Documentation
 
-## What Dev Boss Is
+## Overview
 
-Dev Boss is an AI-assisted software delivery workspace. It manages projects, tasks, engineer runtimes, approvals, and execution flow so a human can supervise end-to-end software work without manually coordinating every step.
+Dev Boss is an AI-assisted software delivery platform. It orchestrates AI engineer agents to design, build, test, and deploy software across projects. Humans supervise the pipeline through approvals, code reviews, and strategy decisions.
 
-The system is designed around a simple operating model:
+### Architecture at a Glance
 
-- a human creates a project that points to a Git repository
-- a human creates a task under that project
-- a human assigns an engineer to the task
-- the engineer runtime picks up runnable stages and executes them with Codex inside Docker
-- the human reviews, replies, approves, merges, and triggers deployment at the right gates
+| Layer | Technology | Role |
+|-------|-----------|------|
+| Frontend | Next.js 16 (Static Export) | S3-hosted dashboard, Kanban board, PRD editor |
+| Backend | FastAPI + SQLAlchemy | REST API, orchestration, state machine |
+| Database | PostgreSQL 16 | All persistent state |
+| Runtime | Docker containers | Isolated AI agents running Opencode CLI |
+| AI Agent | Opencode + DeepSeek v4 Pro | Performs grooming, building, testing, deployment |
+| Auth | External JWT service | Sign-in and token validation |
 
-This is an MVP. It is intentionally opinionated, single-team, and approval-driven.
+The frontend is built as a fully static site hosted on S3. It communicates exclusively with the backend API -- there is no server-side rendering.
 
-## Core Modules
+---
 
-### Overview
+## Core Concepts
 
-The overview page is a lightweight landing page. It gives a quick summary of how many projects, engineers, and tasks exist in the workspace.
+### Organizations
+
+Organizations are the top-level workspace grouping. They define access boundaries for projects, PRDs, tags, and members.
+
+Each organization has:
+
+- **name** and **slug** -- used for identification and routing
+- **members** -- users with role-based access (admin, member)
+- **projects** -- linked projects that inherit the org context
+- **tags** -- org-scoped labels for filtering and categorization
+
+Users are identified by email and authenticated via an external JWT service. When added to an organization, a user record is created if it doesn't already exist. Organization admins can add and remove members and manage roles.
 
 ### Projects
 
-Projects are the main top-level workspace object. Each project stores:
+Projects are the delivery units. Each project maps to a Git repository and is tagged to one workflow.
 
-- project name
-- repository URL
-- default branch
-- deployment config as JSON
-- deployment instructions as free-form text
+A project stores:
 
-Projects are also the place where you open the project board. Each project board shows tasks grouped by workflow stage.
+- **name** and **repo_url** -- the codebase location
+- **default_branch** -- typically \`main\` or \`master\`
+- **workflow** -- which pipeline all tasks in this project follow
+- **organization** -- which org owns this project
+- **deploy_config** -- JSON blob for deployment configuration
+- **deployment_instructions** -- free-form markdown for deploy context
+
+The project board at \`/board?projectId=X\` is the primary monitoring surface. When a project is tagged to a workflow, the board renders stage columns. Tasks are automatically placed in the column matching their current workflow stage.
+
+### Workflows
+
+**Workflows are configurable delivery pipelines.** Instead of a fixed set of stages, you define your own to match any software delivery process.
+
+A workflow has:
+
+- **name** -- e.g. "Standard Web App Pipeline"
+- **description** -- what this workflow is designed for
+- **ordered stages** -- the pipeline sequence
+
+Each **stage** in a workflow has:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| name | string | Display name, e.g. "AI Grooming" |
+| stage_order | int | Position in the pipeline |
+| assigned_engineer_id | FK | Which engineer picks up tasks at this stage |
+| is_ai_executable | bool | Whether an AI runtime container executes this stage |
+| requires_human_approval | bool | Pause task until a human approves |
+| stage_instructions | markdown | Custom prompt telling the AI what to do at this stage |
+| max_rework_attempts | int | Max failure loops before blocking (default: 3) |
+| rework_target_stage_id | FK | Which stage to fall back to on failure |
+
+The workflow editor at \`/workflows/edit?workflowId=X\` provides full control over all stage properties. Stages can be reordered using arrow buttons.
+
+**Example workflow -- Standard SDLC Pipeline:**
+
+| Order | Stage | Engineer | AI? | Approval? | Rework Target |
+|-------|-------|----------|-----|-----------|---------------|
+| 0 | AI Grooming | Backend Engineer | Yes | No | -- |
+| 1 | Approval Gate | -- | No | Yes | -- |
+| 2 | Build | Backend Engineer | Yes | No | Self (rework on same stage) |
+| 3 | QA Testing | QA/Test Engineer | Yes | No | Build (falls back on failure) |
+| 4 | Deploy | DevOps Engineer | Yes | Yes | Self |
 
 ### Engineers
 
 Engineers are reusable AI worker profiles. Each engineer stores:
 
-- engineer name
-- template type
-- skill markdown
-- model name
-- runtime image
-- tool/runtime settings
+- **name** and **template** -- identity and specialization label
+- **skill_markdown** -- tells the AI what expertise it has
+- **model_provider** and **model_name** -- which LLM to use (default: DeepSeek/deepseek-v4-pro)
+- **docker_image** -- container image for the runtime
+- **poll_interval_seconds** -- how often the container checks for work
 
-An engineer can be launched into its own Docker container. When the container is running, it sends heartbeats to the backend and can poll for work.
+An engineer can be launched into multiple Docker containers. Each container sends heartbeats and polls for work in the stages it is assigned to. The engineers page shows real-time health status, runtime capacity, and busy/idle counts.
 
-### Global Configs
+**Engineer assignment is per workflow stage**, not per task. When a task enters a stage, it automatically inherits that stage's engineer. Design your workflows by assigning the right engineer to each pipeline stage.
 
-Global Configs store workspace-wide credentials and platform settings. These are shared across projects and runtimes when needed.
+### PRDs -- Product Requirements Documents
 
-Typical examples:
+PRDs capture feature requirements before they become tasks. The PRD flow is:
 
-- \`codex_auth_json\`
-- \`github_developer_token\`
-- \`aws_access_key_id\`
-- \`aws_secret_access_key\`
-- \`aws_region\`
+1. **Create** a PRD under an organization with a title and summary
+2. **Chat** progressively with the AI to refine the body markdown
+3. **Review** the final document
+4. **Convert** to tasks -- select target projects and enter task titles (one per project)
+
+A PRD has:
+
+- **title** and **summary** -- high-level description
+- **body_markdown** -- the full requirements document (editable)
+- **status** -- draft -> in_review -> approved -> converted -> archived
+- **comments** -- chat thread for progressive refinement
+- **tags** -- linked tags for categorization
+
+The PRD detail page at \`/prds/detail?prdId=X\` has a chat interface where you send messages to progressively build the document. The "Convert to Tasks" panel lets you select multiple projects and create matching tasks -- each task gets the PRD body as its requirement.
+
+This implements human-in-the-loop: you refine the PRD through chat, the AI responds with context, and you confirm by converting to tasks.
 
 ### Tasks
 
-Tasks are the primary delivery objects. A task stores:
+Tasks are the delivery objects that flow through the pipeline. A task stores:
 
-- title
-- requirements
-- acceptance criteria
-- implementation steps
-- assigned engineer
-- current workflow stage
-- branch, PR, deployment metadata
-- comments
-- task runs
-- artifacts
+- **title**, **requirement_markdown**, **acceptance_criteria**, **implementation_steps**
+- **current workflow stage** -- position in the pipeline
+- **status_group** -- todo, in_progress, waiting_approval, blocked, done
+- **assigned_engineer** -- derived from the current stage
+- **branch**, **PR**, **deploy URLs** -- execution artifacts
+- **comments** -- collaboration thread
+- **task_runs** -- execution history
+- **tags** -- categorization tags
 
-### Task Comments
-
-Comments are the main collaboration thread for each task. Both humans and the runtime use this thread.
-
-Comments support Markdown, so they can be used for:
-
-- clarifications
-- status updates
-- structured test findings
-- deployment notes
-- follow-up instructions
+When a task is created under a project with a workflow, it automatically enters the first stage and inherits that stage's engineer.
 
 ### Task Runs
 
-A task run is one concrete execution attempt for a stage such as grooming, build, testing, or deployment. Task runs store:
+A task run is one concrete execution attempt for a stage. Each AI-executable stage creates a TaskRun record. Task runs track:
 
-- execution phase
-- run status
-- timestamps
-- summary
-- structured outcome payload
+| Field | Description |
+|-------|-------------|
+| workflow stage | Which stage this run belongs to |
+| run status | pending -> claimed -> running -> completed/failed/waiting_human |
+| engineer | Who executed it |
+| attempt_number | How many times this stage has been retried |
+| timestamps | claimed_at, started_at, completed_at |
+| outcome | Structured result (completed, blocked, failed, needs_human_input) |
+| token usage | Tokens consumed and cost (tracked separately) |
 
-Task runs are useful for understanding what happened and when.
+### Tags
+
+Tags provide flexible categorization for tasks and PRDs. Tags are scoped to an organization.
+
+Each tag has a **name** and optional **color**. Tags can be assigned to tasks and PRDs, and used as filters on the board.
+
+Common use cases:
+
+- Sprint labels (Sprint 1, Sprint 2, ...)
+- Feature groupings (Auth, Payments, Notifications)
+- Type classification (Bug, Feature, Tech Debt)
+- Priority markers (P0, P1, P2)
+
+**Tag management** happens through the organization detail page at \`/organizations/detail?orgId=X\`. You can create tags with color pickers and delete them.
+
+### Token Spend Tracking
+
+Every AI execution is tracked for cost visibility. The \`token_usages\` table records:
+
+| Field | Description |
+|-------|-------------|
+| tokens_in | Input tokens consumed |
+| tokens_out | Output tokens generated |
+| cost_usd | Calculated cost in USD |
+| model | Which model was used |
+| task_id / task_run_id / prd_id | What entity consumed these tokens |
+| user_id | Which user initiated the work |
+
+Token summaries are available per task (\`/tasks/{id}/token-summary\`) and per project (\`/projects/{id}/token-summary\`). This lets you track the monetary cost of AI execution at any granularity.
+
+---
+
+## Stage Lifecycle
+
+### Outcomes
+
+When an AI-executable stage runs, the agent produces one of four outcomes:
+
+| Outcome | Behavior |
+|---------|----------|
+| \`completed\` | Stage succeeded. Task advances to the next stage. |
+| \`needs_human_input\` | Agent needs a decision. Task pauses at \`waiting_approval\`. |
+| \`blocked\` | External blocker. Enters rework logic or pauses. |
+| \`failed\` | Execution error. Enters rework logic or pauses. |
+
+### Rework Logic
+
+Each stage configures rework behavior:
+
+- **max_rework_attempts** -- how many failures before requiring human input (default: 3)
+- **rework_target_stage** -- which stage to fall back to on failure
+
+Example flow with QA Testing (\`max_rework_attempts=2\`, rework_target=Build):
+
+    Build (complete) -> QA (failed, rework #1) -> Build (complete) -> QA (failed, rework #2)
+    -> Build (complete) -> QA (failed, rework #3 > max) -> WAITING_HUMAN
+    
+
+
+After the third failure exceeds the max, the task is blocked and requires human intervention.
+
+### Approval Gates
+
+A stage with \`requires_human_approval = true\` pauses the task until a human explicitly approves. The status group shows \`waiting_approval\`.
+
+Non-AI-executable stages (\`is_ai_executable = false\`) with approval enabled act as pure gates -- the task sits there until a human advances it manually or approves the preceding task run.
+
+### Status Groups
+
+Each task has a status_group for quick state identification:
+
+| Group | Meaning |
+|-------|---------|
+| \`todo\` | Ready for pickup |
+| \`in_progress\` | An engineer runtime is actively executing |
+| \`waiting_approval\` | Needs human review or decision |
+| \`blocked\` | Something is preventing progress |
+| \`done\` | All stages completed |
+
+---
 
 ## Runtime Architecture
 
-Each launched engineer runs inside its own Docker container.
+### Container Lifecycle
 
-The runtime currently works like this:
+Each engineer runs inside its own Docker container with Opencode CLI and the DeepSeek model.
 
-1. the backend launches an engineer container
-2. the container sends a heartbeat to the backend every minute
-3. the container polls the backend for the next pending task run
-4. once a task is claimed, the runtime creates a clean workspace for that task
-5. it clones the project repository into that workspace
-6. it prepares the correct branch context for the current stage
-7. it writes the task bundle files
-8. it invokes Codex CLI
-9. it posts readable task comments and a structured outcome back to the backend
+**Launch flow:**
+1. Backend builds or reuses the runtime Docker image
+2. Container is launched on the same Docker network as the backend
+3. Container sends engineer-level heartbeat to \`/engineer-runtimes/{id}/heartbeat\`
+4. Container polls \`/agent/poll-next-task\` for work in stages assigned to its engineer
+5. On claiming a task, sends task-level heartbeats during execution
 
-The runtime is isolated by Docker, but it is intentionally given enough access to:
+**Execution flow:**
+1. Clone the project repository into \`/tmp/devboss-runtime/task-{id}/repo/\`
+2. Create or checkout the task branch
+3. Write task bundle files (TASK.md, COMMENTS.md, PROJECT_CONTEXT.md, STAGE_INSTRUCTIONS.md)
+4. Invoke \`opencode run --model deepseek/deepseek-v4-pro --dangerously-skip-permissions --format json\`
+5. Parse the JSON outcome
+6. Push branch changes, create PR if applicable
+7. Post a human-readable comment and structured outcome to the backend
 
-- modify repository files
-- create branches
-- commit changes
-- push branches
-- call GitHub APIs
-- run build and test commands
+### Health Monitoring
 
-## Health Ping Flow
+Engineer health is tracked via heartbeats:
 
-Engineer health is tracked with a heartbeat flow:
+- **starting** -- container launched, waiting for first heartbeat
+- **healthy** -- heartbeats received within the timeout window (90 seconds)
+- **heartbeat_missing** -- no heartbeat received within the timeout
+- **stopped** -- explicitly stopped by user
+- **launch_failed** -- container could not start
 
-1. when an engineer is launched, the backend marks it as \`starting\`
-2. the runtime sends a heartbeat every minute
-3. each heartbeat marks the engineer as \`healthy\`
-4. if the backend stops receiving heartbeats within the timeout window, the engineer is marked as \`heartbeat missing\`
-5. if the runtime is explicitly stopped, the engineer is marked as \`stopped\`
+### Isolation and Permissions
 
-This tells you whether the container is actually alive and responsive.
+Runtime containers are Docker-isolated but intentionally given access to:
+
+- Clone and push to GitHub repositories
+- Create and switch branches
+- Commit code changes
+- Run build, test, and deploy commands
+- Create pull requests via GitHub API
+
+---
 
 ## Authentication and Secrets
 
-### Codex
+### User Authentication
 
-Codex CLI is installed inside the runtime image.
+Authentication is handled by an external JWT service. Users sign in with email and password. The JWT token is stored in localStorage and sent with every API request. The AuthGuard component wraps the entire app and redirects unauthenticated users to the login page.
 
-Authentication is currently provided through the \`codex_auth_json\` global config:
+### API Keys
 
-- the backend reads \`codex_auth_json\`
-- it passes the value into the runtime container
-- the runtime writes it to \`/root/.codex/auth.json\`
-- Codex CLI then uses that auth state during execution
+Provider API keys are stored in the Global Configs table and injected into runtime containers:
 
-Engineers can also opt into Caveman-style terse responses through \`runtime_config.caveman_enabled\`.
+- \`deepseek_api_key\` -- for Opencode/DeepSeek execution
+- \`github_developer_token\` -- for authenticated Git operations and PR creation
+- \`aws_access_key_id\` / \`aws_secret_access_key\` / \`aws_region\` -- for AWS deployment
 
-- when enabled, the runtime writes \`/root/.codex/config.toml\` with Codex hooks turned on
-- it also writes \`/root/.codex/hooks.json\` so each Codex session starts with a terse-response instruction
-- when disabled, those files are removed and runtime behavior stays unchanged
+Each key is marked as \`is_secret\` in the config, masking the value in the UI.
 
-### GitHub
-
-Git operations and PR creation rely on \`github_developer_token\`.
-
-The runtime uses this token for:
-
-- authenticated repository clone
-- branch push
-- PR creation through the GitHub API
-
-### AWS
-
-AWS credentials are intended to come from Global Configs and be injected into the runtime when deployment is needed.
+---
 
 ## Task Bundle
 
-For each claimed task run, Dev Boss creates a task bundle for Codex. The bundle includes:
+For each claimed task run, the backend assembles a task bundle written to the runtime workspace:
 
-- \`TASK.md\`
-- \`COMMENTS.md\`
-- \`PROJECT_CONTEXT.md\`
-- \`STAGE_INSTRUCTIONS.md\`
-- attachments when present
+| File | Contents |
+|------|----------|
+| \`TASK.md\` | Title, status, requirements, acceptance criteria, implementation steps, open questions |
+| \`COMMENTS.md\` | Full comment thread with author attribution |
+| \`PROJECT_CONTEXT.md\` | Repo URL, branch, deploy config, deployment instructions, engineer skill markdown |
+| \`STAGE_INSTRUCTIONS.md\` | Stage-specific instructions from the workflow stage config |
+| \`ATTACHMENTS/\` | Uploaded artifact files (logs, screenshots, test reports) |
 
-This gives Codex the current requirements, history, repo context, deployment context, and stage-specific rules in one place.
+---
 
-## Workflow Stages
+## Stage Instructions
 
-### Draft
+Each workflow stage can have its own **stage instructions** -- free-form markdown that tells the AI exactly what to do. These are stored in the database per stage and included in the task bundle.
 
-Human authors the task. This is where the task should become clear, useful, and testable.
+Legacy prompt files (\`ai_grooming.md\`, \`in_progress.md\`, etc.) serve as fallbacks when a stage has no custom instructions.
 
-Recommended content:
+Example for a Build stage:
 
-- what needs to be done
-- what success looks like
-- implementation constraints
-- any relevant links or assets
+\`\`\`markdown
+You are in the Build stage. Implement the task requirements end-to-end.
+- Add or update tests
+- Run local verification (tests, lints, builds)
+- Commit changes with descriptive messages
+- Push the branch to origin
+- Do NOT create a pull request
 
-### AI Grooming
+Outcome JSON keys:
+- outcome_type: "completed" | "needs_human_input" | "blocked" | "failed"
+- summary: what was done
+- branch_name: the branch you worked on
+\`\`\`
 
-AI Grooming is not meant to implement the task.
+---
 
-Its job is to:
+## Deployment Configuration
 
-- understand the requirement
-- inspect the codebase
-- identify gaps, assumptions, and risks
-- decide whether the task is ready for full implementation
-
-Possible outcomes:
-
-- ask for human clarification
-- declare the task ready for build
-
-### Ready for Build
-
-This is a human approval gate. The human confirms that grooming is complete and the task can move into implementation.
-
-### In Progress
-
-This is the implementation stage.
-
-The engineer is expected to:
-
-- work on a task branch
-- write code
-- run tests or builds where appropriate
-- commit and push the branch
-- leave the task ready for AI Testing
-
-### AI Testing
-
-This stage validates the implementation. The engineer is expected to:
-
-- continue from the task branch created during implementation
-- run validation steps
-- compare behavior against acceptance criteria
-- produce clear evidence
-
-If AI Testing fails, Dev Boss can automatically loop the task back to \`In Progress\` for rework up to three times. After that, it pauses for human input.
-
-### Human Testing
-
-This is the human validation stage. The human checks:
-
-- user experience
-- business correctness
-- any final behavior that needs manual confirmation
-
-Human Testing is also the holding area for completed work that you do **not** want to release yet.
-
-### Ready to Deploy
-
-This stage is the project's release queue entry point.
-
-Only move a task here when you actually want it to line up for release. Dev Boss serializes this stage per project, so only one task can actively hold the release slot across \`Ready to Deploy\` and \`Deployment\` at a time.
-
-The engineer is expected to:
-
-- use the task branch
-- sync it with the default branch if needed
-- resolve safe conflicts
-- prepare or create the final PR
-- report the PR link back on the task
-
-Human action expected here:
-
-- review the PR
-- merge the PR into the project's default branch
-- use this stage to choose release order by deciding which task enters the queue first
-
-### Deployment
-
-This stage represents actual deployment work after the PR has been merged.
-
-The engineer is expected to:
-
-- work from the project's default branch
-- use the project's deployment config
-- use the project's deployment instructions
-- run build and deployment steps
-- attach deployment evidence
-
-Deployment is also serialized per project. While one task is deploying, later tasks in \`Ready to Deploy\` wait in the project release queue.
-
-Once deployment succeeds, the task moves to \`Archived\`.
-
-### Archived
-
-Archived means the delivery flow is finished and the task is no longer active on the board.
-
-## Stage Instruction Files
-
-Dev Boss uses global markdown instruction files for stage behavior. These live in the backend prompt folder and are included in the task bundle as \`STAGE_INSTRUCTIONS.md\`.
-
-Current stage prompt files:
-
-- \`ai_grooming.md\`
-- \`in_progress.md\`
-- \`ai_testing.md\`
-- \`ready_to_deploy.md\`
-- \`deployment.md\`
-
-These files define what Codex should do, what it must not do, and how it should choose outcomes.
-
-## Project Deployment Configuration
-
-Deployment configuration is stored on the project itself, not inside the repository.
-
-This keeps deployment control inside Dev Boss and allows different projects to use different deployment models.
-
-The deploy config is entered as JSON so it stays flexible.
-
-Example:
+Deployment config is stored on the project as a JSON blob, keeping deployment control inside Dev Boss:
 
 \`\`\`json
 {
@@ -320,109 +345,111 @@ Example:
 }
 \`\`\`
 
-## Project Deployment Instructions
+Deployment instructions (free-form text) complement the JSON config with narrative context about deploy order, env variable caveats, and verification steps.
 
-Projects can also store deployment instructions alongside the deploy config.
+---
 
-This is useful when the project needs extra context beyond structured JSON, for example:
+## Navigation Map
 
-- exact deployment order
-- caveats about environment variables
-- how to verify success
-- special cleanup or invalidation steps
+| Page | Route | Purpose |
+|------|-------|---------|
+| Overview | \`/\` | Project/engineer/task counts |
+| Board | \`/board?projectId=X\` | Kanban board for a project |
+| Projects | \`/projects\` | Project CRUD table |
+| Workflows | \`/workflows\` | Workflow list |
+| Workflow Editor | \`/workflows/edit?workflowId=X\` | Stage configuration |
+| PRDs | \`/prds\` | PRD list with org filter |
+| PRD Detail | \`/prds/detail?prdId=X\` | Chat, edit, convert to tasks |
+| Organizations | \`/organizations\` | Org list |
+| Org Detail | \`/organizations/detail?orgId=X\` | Members, tags |
+| Engineers | \`/engineers\` | Engineer runtime management |
+| Settings | \`/settings\` | Global config store |
+| Task Detail | \`/tasks/view?taskId=X\` | Full task view with comments |
 
-Example:
+All routes use query parameters for dynamic values. The app is a static export with no server-side routing.
 
-- build using \`npm run build\`
-- upload the contents of \`out/\` to the configured S3 bucket
-- invalidate CloudFront after upload
-- verify the homepage responds successfully
+---
 
-## Current Deployment Assumption
+## Setup Checklist
 
-The intended deployment flow is:
+1. **Global Configs** -- Add \`deepseek_api_key\`, \`github_developer_token\`, AWS credentials
+2. **Organization** -- Create an organization (or use the seeded "Dev Boss Workspace")
+3. **Engineers** -- Create engineer profiles (backend, frontend, QA, devops)
+4. **Workflow** -- Define a workflow with stages and assign engineers to each stage
+5. **Tags** -- Create tags under the organization for sprint/feature categorization
+6. **Launch runtimes** -- Launch engineer containers from the engineers page
+7. **Projects** -- Create projects tagged to the workflow and organization
+8. **PRDs** (optional) -- Create PRDs to progressively define requirements, then convert to tasks
+9. **Tasks** -- Create tasks under projects; they auto-enter the first stage
+10. **Monitor** -- Watch the board; approve gates; review PRs; reply to agent questions
 
-1. implementation happens on a task branch
-2. AI Testing validates that branch
-3. Ready to Deploy prepares the final PR
-4. the human merges the PR
-5. Deployment runs from the project's default branch
-6. the task is archived after successful deployment
+---
 
-## What Works Today
+## Operating Patterns
 
-Current implemented capabilities include:
+### PRD-Driven Development
 
-- project management
-- engineer management
-- global config management
-- project board with workflow lanes
-- engineer container launch, stop, and restart
-- engineer heartbeat monitoring
-- task creation, editing, deletion, retry
-- markdown task comments
-- task-run tracking
-- repo checkout in runtime
-- branch creation and push
-- PR creation flow for release handoff
-- stage-specific task bundles for Codex
+1. Create a PRD under your organization
+2. Chat with the AI to progressively build the document body
+3. Review the final markdown
+4. Click "Convert to Tasks" and select target projects
+5. Tasks are created with the PRD body as requirements
 
-## What Is Still Evolving
+### Direct Task Creation
 
-Areas that are still MVP-level or partially implemented:
+1. Open the project board
+2. Click "Create Task"
+3. Fill in requirements, acceptance criteria, and implementation steps
+4. The task auto-enters the first workflow stage
 
-- deployment is still prompt-driven rather than fully adapter-driven
-- multi-agent collaboration per task is not implemented
-- production-grade secret management is not implemented
-- there is no advanced RBAC or multi-tenant support
-- deployment evidence storage is still basic
-- cost controls and scheduling policies are minimal
+### Human Review Gates
+
+1. When a task reaches an approval gate, it shows \`waiting_approval\`
+2. Review the AI's output in the task comments
+3. Click "Approve" to advance or reply with feedback
+4. The task resumes at the next stage
+
+### Cost Tracking
+
+1. Token usage is automatically recorded during AI execution
+2. View per-task costs at \`/tasks/view?taskId=X\` (token summary)
+3. View per-project costs at the project board (aggregated)
+4. Use this data to estimate and budget AI spend
+
+---
 
 ## Assumptions
 
-Dev Boss currently assumes:
-
-- one internal team
-- one repository per project
-- one assigned engineer per task at a time
+- Single organization per workspace (MVP)
+- One repository per project
+- One workflow per project
+- One AI engineer per workflow stage
 - GitHub-hosted source repositories
 - Docker available to run engineer containers
-- humans still control key approvals and merges
-- deployment credentials are centrally managed in Global Configs
+- Humans control approvals, PR merges, and deployment triggers
+- Opencode CLI with DeepSeek v4 Pro as the AI agent
+- Frontend deployed as static files on S3 or any CDN
+- External JWT service for authentication
 
-## Suggested Setup Checklist
+---
 
-When bringing up a new workspace, do this in order:
+## API Reference
 
-1. add required Global Configs
-2. create at least one engineer profile
-3. launch the engineer
-4. create a project with repo URL and default branch
-5. add deployment config and deployment instructions if deployment is needed
-6. create a task and assign the engineer
-7. move the task into the first runnable stage
-8. monitor the task thread and approve handoffs as needed
+The backend exposes a REST API at \`http://backend:8000\`. Full OpenAPI docs are available at \`/docs\`.
 
-## Recommended Global Configs
+### Key Endpoint Groups
 
-For a typical GitHub + Codex + AWS workflow, these are the main configs to add:
-
-- \`codex_auth_json\`
-- \`github_developer_token\`
-- \`aws_access_key_id\`
-- \`aws_secret_access_key\`
-- \`aws_region\`
-
-## How Humans Should Use Dev Boss
-
-The cleanest operating pattern is:
-
-- write tasks clearly
-- treat AI Grooming as a readiness review, not implementation
-- use task comments for clarifications and approvals
-- review the PR in Ready to Deploy
-- merge manually
-- then trigger Deployment
-
-This keeps Dev Boss aligned with an auditable, approval-driven SDLC while still letting the AI runtime do most of the heavy lifting.
+| Group | Prefix | Purpose |
+|-------|--------|---------|
+| Projects | \`/projects\` | Project CRUD, board per project |
+| Workflows | \`/workflows\` | Workflow and stage CRUD, reorder |
+| Organizations | \`/organizations\` | Org CRUD, member management |
+| Engineers | \`/engineers\` | Engineer CRUD, runtime launch/stop/restart |
+| Tasks | \`/tasks\` | Task CRUD, comments, retry |
+| PRDs | \`/prds\` | PRD CRUD, chat, convert to tasks |
+| Tags | \`/tags\`, \`/organizations/{id}/tags\` | Tag CRUD, set tags on tasks/PRDs |
+| Tokens | \`/token-usage\`, \`/projects/{id}/token-summary\` | Record and query token spend |
+| Agent | \`/agent/\` | Runtime polling, heartbeat, logs, outcomes |
+| Board | \`/board\`, \`/projects/{id}/board\` | Kanban lane data |
+| Settings | \`/settings\` | Global config key-value store |
 `.trim();

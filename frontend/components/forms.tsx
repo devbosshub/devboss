@@ -4,22 +4,25 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 
 import { api } from "@/lib/api";
-import { ConfigSetting, Engineer, EngineerTemplate, Project, RuntimeConfig, Task, TaskStatus } from "@/lib/types";
+import { ConfigSetting, Engineer, EngineerTemplate, ModelProvider, Project, Task, TaskStatus, Workflow } from "@/lib/types";
 
 export function ProjectForm({
   project,
   onCreated,
-  onUpdated
+  onUpdated,
+  workflows,
 }: {
   project?: Project;
   onCreated?: () => void;
   onUpdated?: () => void;
+  workflows?: Workflow[];
 }) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [name, setName] = useState(project?.name ?? "");
   const [repoUrl, setRepoUrl] = useState(project?.repo_url ?? "");
   const [defaultBranch, setDefaultBranch] = useState(project?.default_branch ?? "main");
+  const [workflowId, setWorkflowId] = useState<number | "">(project?.workflow_id ?? "");
   const [deployConfigText, setDeployConfigText] = useState(
     JSON.stringify(project?.deploy_config ?? {}, null, 2)
   );
@@ -49,29 +52,27 @@ export function ProjectForm({
           }
 
           setDeployConfigError("");
+          const payload: Partial<Project> = {
+            name,
+            repo_url: repoUrl,
+            default_branch: defaultBranch,
+            deploy_config: parsedDeployConfig,
+            deployment_instructions: deploymentInstructions,
+            engineer_pool: project?.engineer_pool ?? [],
+            workflow_id: workflowId === "" ? null : workflowId,
+          };
+
           if (project) {
-            await api.updateProject(project.id, {
-              name,
-              repo_url: repoUrl,
-              default_branch: defaultBranch,
-              deploy_config: parsedDeployConfig,
-              deployment_instructions: deploymentInstructions,
-            } satisfies Partial<Project>);
+            await api.updateProject(project.id, payload);
             onUpdated?.();
           } else {
-            await api.createProject({
-              name,
-              repo_url: repoUrl,
-              default_branch: defaultBranch,
-              deploy_config: parsedDeployConfig,
-              deployment_instructions: deploymentInstructions,
-              engineer_pool: []
-            } satisfies Partial<Project>);
+            await api.createProject(payload);
             onCreated?.();
           }
           setName("");
           setRepoUrl("");
           setDefaultBranch("main");
+          setWorkflowId("");
           setDeployConfigText("{}");
           setDeploymentInstructions("");
           router.refresh();
@@ -94,6 +95,17 @@ export function ProjectForm({
       <label className="field">
         <span>Default branch</span>
         <input value={defaultBranch} onChange={(event) => setDefaultBranch(event.target.value)} required />
+      </label>
+      <label className="field">
+        <span>Workflow</span>
+        <select value={workflowId} onChange={(event) => setWorkflowId(event.target.value ? Number(event.target.value) : "")}>
+          <option value="">None (use default lanes)</option>
+          {(workflows ?? []).map((wf) => (
+            <option key={wf.id} value={wf.id}>
+              {wf.name}
+            </option>
+          ))}
+        </select>
       </label>
       <div className="task-card">
         <h3>Deployment Config</h3>
@@ -152,17 +164,14 @@ export function EngineerForm({
 }) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
-  const initialRuntimeConfig: RuntimeConfig = engineer?.runtime_config ?? {
-    max_active_tasks: 1
-  };
   const [name, setName] = useState(engineer?.name ?? "");
   const [template, setTemplate] = useState<EngineerTemplate>(engineer?.template ?? "backend_engineer");
   const [skillMarkdown, setSkillMarkdown] = useState(engineer?.skill_markdown ?? templateDescriptions[engineer?.template ?? "backend_engineer"]);
-  const [modelName, setModelName] = useState(engineer?.model_name ?? "gpt-5.4");
+  const [modelProvider, setModelProvider] = useState<ModelProvider>(engineer?.model_provider ?? "deepseek");
+  const [modelName, setModelName] = useState(engineer?.model_name ?? "deepseek-v4-pro");
   const [dockerImage, setDockerImage] = useState(engineer?.docker_image ?? "devboss-engineer:latest");
   const [pollIntervalSeconds, setPollIntervalSeconds] = useState(String(engineer?.poll_interval_seconds ?? 30));
   const [isActive, setIsActive] = useState(engineer?.is_active ?? true);
-  const [cavemanEnabled, setCavemanEnabled] = useState(initialRuntimeConfig.caveman_enabled === true);
 
   return (
     <form
@@ -170,23 +179,15 @@ export function EngineerForm({
       onSubmit={(event) => {
         event.preventDefault();
         startTransition(async () => {
-          const runtimeConfig: RuntimeConfig = { ...initialRuntimeConfig };
-
-          if (cavemanEnabled) {
-            runtimeConfig.caveman_enabled = true;
-          } else {
-            delete runtimeConfig.caveman_enabled;
-          }
           const payload = {
             name,
             template,
             skill_markdown: skillMarkdown,
+            model_provider: modelProvider,
             model_name: modelName,
             docker_image: dockerImage,
             poll_interval_seconds: Number(pollIntervalSeconds),
-            enabled_tools: engineer?.enabled_tools ?? ["git", "shell", "tests"],
             allowed_projects: engineer?.allowed_projects ?? [],
-            runtime_config: runtimeConfig,
             is_active: isActive
           } satisfies Partial<Engineer>;
 
@@ -229,6 +230,17 @@ export function EngineerForm({
         </select>
       </label>
       <label className="field">
+        <span>Model Provider</span>
+        <select value={modelProvider} onChange={(event) => setModelProvider(event.target.value as ModelProvider)}>
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="google">Google</option>
+          <option value="groq">Groq</option>
+        </select>
+      </label>
+      <label className="field">
         <span>Model</span>
         <input value={modelName} onChange={(event) => setModelName(event.target.value)} />
       </label>
@@ -246,18 +258,6 @@ export function EngineerForm({
           <option value="active">Active</option>
           <option value="inactive">Inactive</option>
         </select>
-      </label>
-      <label className="checkbox-field" htmlFor="caveman-terse-mode">
-        <span className="checkbox-copy">
-          <span className="checkbox-title">Caveman terse mode</span>
-          <span className="checkbox-description">Enable compact Codex responses for this engineer runtime.</span>
-        </span>
-        <input
-          id="caveman-terse-mode"
-          checked={cavemanEnabled}
-          onChange={(event) => setCavemanEnabled(event.target.checked)}
-          type="checkbox"
-        />
       </label>
       <label className="field">
         <span>Skill markdown</span>

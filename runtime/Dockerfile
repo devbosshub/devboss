@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bubblewrap git nodejs npm \
-    && npm install -g @openai/codex \
+    && npm install -g opencode-ai \
     && pip install --no-cache-dir awscli \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

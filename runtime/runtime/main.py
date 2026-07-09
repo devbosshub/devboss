@@ -6,12 +6,13 @@ from socket import gethostname
 
 from runtime.client import DevBossClient
 from runtime.config import RuntimeSettings
-from runtime.executor import run_codex
+from runtime.executor import run_opencode
 from runtime.github import create_or_get_pull_request
 from runtime.task_bundle import write_task_bundle
 from runtime.workspace import ensure_task_branch, persist_branch_changes, prepare_repo_workspace
 
-ALLOWED_OUTCOMES_BY_STATUS = {
+ALLOWED_OUTCOMES = {"completed", "needs_human_input", "blocked", "failed"}
+LEGACY_OUTCOMES_BY_STATUS = {
     "ai_grooming": {"needs_human_input", "grooming_complete", "blocked", "failed"},
     "in_progress": {"needs_human_input", "build_complete", "blocked", "failed"},
     "ai_testing": {"needs_human_input", "testing_complete", "blocked", "failed"},
@@ -44,10 +45,6 @@ def build_human_readable_comment(task: dict, outcome: dict) -> str:
         details.append(f"- **Blocked reason:** {outcome['blocked_reason']}")
     if outcome.get("branch_name"):
         details.append(f"- **Branch:** `{outcome['branch_name']}`")
-        if outcome["outcome_type"] == "build_complete":
-            details.append("- **Branch handoff:** Implementation is complete and this branch has been pushed for AI Testing to continue from the same code state.")
-        elif outcome["outcome_type"] == "testing_complete":
-            details.append("- **Branch handoff:** AI Testing ran against this branch, so later stages should continue from the same branch state.")
     if outcome.get("pr_url"):
         details.append(f"- **Pull request:** {outcome['pr_url']}")
     if outcome.get("deploy_url"):
@@ -76,23 +73,28 @@ def branch_to_clone(task: dict, project: dict) -> str:
     return branch_name or project["default_branch"]
 
 
-def normalize_outcome_for_task(task: dict, outcome: dict) -> dict:
-    allowed_outcomes = ALLOWED_OUTCOMES_BY_STATUS.get(task["status"], set())
+def normalize_outcome_for_task(task: dict, outcome: dict, stage: dict | None = None) -> dict:
+    if stage:
+        allowed_outcomes = ALLOWED_OUTCOMES
+    else:
+        allowed_outcomes = LEGACY_OUTCOMES_BY_STATUS.get(task["status"], ALLOWED_OUTCOMES)
+
     if outcome["outcome_type"] in allowed_outcomes:
         if task["status"] not in PR_URL_ALLOWED_STATUSES:
             outcome["pr_url"] = None
         return outcome
+
     allowed_list = ", ".join(sorted(allowed_outcomes)) or "none"
     return {
         "outcome_type": "failed",
         "summary": (
-            f"Codex returned outcome '{outcome['outcome_type']}' for task status '{task['status']}', "
-            f"which is not allowed. Allowed outcomes: {allowed_list}. Original summary: {outcome.get('summary', '')}"
+            f"Opencode returned outcome '{outcome['outcome_type']}' which is not allowed. "
+            f"Allowed outcomes: {allowed_list}. Original summary: {outcome.get('summary', '')}"
         ).strip(),
         "branch_name": outcome.get("branch_name"),
         "pr_url": outcome.get("pr_url"),
         "deploy_url": outcome.get("deploy_url"),
-        "blocked_reason": f"Invalid stage outcome from Codex: {outcome['outcome_type']} for task status {task['status']}.",
+        "blocked_reason": f"Invalid outcome from Opencode: {outcome['outcome_type']}.",
     }
 
 
@@ -113,7 +115,7 @@ def start_heartbeat_loop(
                 status_message="Engineer runtime is active.",
             )
             if task_run_id is not None:
-                client.heartbeat(task_run_id, "Codex execution in progress")
+                client.heartbeat(task_run_id, "Opencode execution in progress")
             stop_event.wait(settings.heartbeat_interval_seconds)
 
     thread = threading.Thread(target=heartbeat, daemon=True)
@@ -141,6 +143,7 @@ def run_loop() -> None:
         payload = client.poll_next_task(settings.runtime_id)
         task_run = payload.get("task_run")
         task = payload.get("task")
+        stage = payload.get("stage")
 
         if not task_run or not task:
             time.sleep(settings.poll_interval_seconds)
@@ -167,21 +170,20 @@ def run_loop() -> None:
                 task_run["id"],
                 f"Claimed task #{task['id']}, cleaned workspace, checked out the repository into {repo_root}, and prepared branch `{branch_name}`.",
             )
-            client.heartbeat(task_run["id"], "Starting Codex execution")
-            outcome, _raw_output = run_codex(task_root, settings.codex_command, settings.dry_run)
-            outcome = normalize_outcome_for_task(task, outcome)
+            client.heartbeat(task_run["id"], "Starting Opencode execution")
+            model = f"{settings.model_provider}/{settings.model_name}"
+            outcome, _raw_output = run_opencode(task_root, settings.opencode_command, model, settings.dry_run)
+            outcome = normalize_outcome_for_task(task, outcome, stage)
             outcome["branch_name"] = None if task["status"] in {"ai_grooming", "deployed"} else branch_name
 
-            if outcome["outcome_type"] in {"build_complete", "testing_complete"} or (
-                outcome["outcome_type"] == "deployment_complete" and task["status"] == "ready_to_deploy"
-            ):
+            if outcome["outcome_type"] in {"build_complete", "testing_complete", "completed"}:
                 persist_branch_changes(
                     repo_root,
                     branch_name,
                     f"Dev Boss task {task['id']}: {outcome['outcome_type'].replace('_', ' ')}",
                 )
 
-            if outcome["outcome_type"] == "deployment_complete" and task["status"] == "ready_to_deploy":
+            if outcome["outcome_type"] in ("deployment_complete", "completed") and task["status"] == "ready_to_deploy":
                 pr_url = create_or_get_pull_request(
                     payload["project"]["repo_url"],
                     settings.github_token,

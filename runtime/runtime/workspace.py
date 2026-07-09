@@ -80,7 +80,7 @@ def ensure_task_branch(
         branch_name = (
             existing_branch_name
             if existing_branch_name and existing_branch_name != default_branch
-            else f"codex/task-{task_id}"
+            else f"opencode/task-{task_id}"
         )
         _run_git(repo_root, ["checkout", "-B", branch_name])
         return branch_name

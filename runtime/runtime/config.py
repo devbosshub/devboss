@@ -10,12 +10,14 @@ class RuntimeSettings(BaseSettings):
     runtime_id: int = 1
     poll_interval_seconds: int = 15
     workspace_dir: str = "/tmp/devboss-runtime"
-    codex_command: str = "codex"
-    dry_run: bool = True
+    opencode_command: str = "opencode"
+    dry_run: bool = False
     heartbeat_interval_seconds: int = 60
-    heartbeat_only: bool = True
+    heartbeat_only: bool = False
     container_name: str = ""
     github_token: str = ""
+    model_provider: str = "deepseek"
+    model_name: str = "deepseek-v4-pro"
 
     model_config = SettingsConfigDict(env_prefix="DEVBOSS_", extra="ignore")
 

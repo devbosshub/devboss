@@ -1,6 +1,7 @@
 import "@/app/globals.css";
 
 import { ReactNode } from "react";
+import { AuthGuard } from "@/components/auth-guard";
 
 export const metadata = {
   title: "Dev Boss",
@@ -10,7 +11,9 @@ export const metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body suppressHydrationWarning>{children}</body>
+      <body suppressHydrationWarning>
+        <AuthGuard>{children}</AuthGuard>
+      </body>
     </html>
   );
 }
