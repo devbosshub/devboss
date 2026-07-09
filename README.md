@@ -9,7 +9,7 @@ This repository contains:
 
 - `backend/` FastAPI API, orchestration logic, workflow state machine, storage, and tests
 - `frontend/` Next.js dashboard UI
-- `runtime/` Dockerized engineer runtime that runs Codex and sends heartbeats back to the backend
+- `runtime/` Dockerized engineer runtime that runs Opencode and sends heartbeats back to the backend
 - `docker-compose.yml` local development stack with PostgreSQL
 
 ## What You Need
@@ -20,7 +20,7 @@ Before starting Dev Boss locally, make sure you have:
 - Node.js and npm if you want to run the frontend outside Docker
 - Python 3.11+ if you want to run backend tests locally
 - A GitHub personal access token with repo access
-- A Codex auth JSON payload for the runtime, usually from `~/.codex/auth.json`
+- API keys for the model providers you want to use (e.g., DeepSeek, OpenAI, Anthropic)
 
 Optional for deployment testing:
 
@@ -84,17 +84,14 @@ After the app is running, open `Global Configs` in the UI and add the required c
 
 These are the minimum configs needed for engineers to launch and work on tasks:
 
-#### `codex_auth_json`
+#### Provider API Key
 
-This should be the full contents of your local Codex auth file.
+Add at least one provider API key as a global config. The key name should follow the pattern `<provider>_api_key` (e.g., `deepseek_api_key`, `openai_api_key`, `anthropic_api_key`). The value is your API key string.
 
-Example source on your machine:
+Example for DeepSeek:
 
-```bash
-cat ~/.codex/auth.json
-```
-
-Copy the full JSON content and paste it into the `codex_auth_json` global config value.
+- **Key:** `deepseek_api_key`
+- **Value:** `sk-your-deepseek-api-key`
 
 #### `github_developer_token`
 
@@ -160,7 +157,7 @@ From the `Engineers` page:
 When started, an engineer:
 
 - launches a Docker container
-- writes the configured Codex auth JSON into `/root/.codex/auth.json`
+- provides the configured provider API key to the runtime container
 - sends heartbeat pings back to the backend
 - polls for work when assigned tasks are in runnable AI stages
 
@@ -201,7 +198,7 @@ Human writes the task requirements.
 
 #### AI Grooming
 
-Codex inspects the task and repository, identifies gaps, and decides whether the task is implementation-ready.
+Opencode inspects the task and repository, identifies gaps, and decides whether the task is implementation-ready.
 
 #### Ready for Build
 
@@ -213,7 +210,7 @@ The engineer implements the task on a task branch and prepares it for the next p
 
 #### AI Testing
 
-Codex validates the branch, runs checks, and reports issues or success.
+Opencode validates the branch, runs checks, and reports issues or success.
 
 #### Human Testing
 
@@ -221,11 +218,11 @@ Human reviews the outcome and confirms behavior before PR/deployment preparation
 
 #### Ready to Deploy
 
-Codex prepares the pull request and final release handoff. Human still controls when to move into actual deployment.
+Opencode prepares the pull request and final release handoff. Human still controls when to move into actual deployment.
 
 #### Deployment
 
-Codex deploys from the project default branch using project deployment config and deployment instructions.
+Opencode deploys from the project default branch using project deployment config and deployment instructions.
 
 #### Archived
 
@@ -233,7 +230,7 @@ The task is complete and no longer shown in the default working board.
 
 ## How Engineers Work
 
-When an engineer claims a task, Dev Boss prepares a task bundle for Codex containing:
+When an engineer claims a task, Dev Boss prepares a task bundle for Opencode containing:
 
 - `TASK.md`
 - `COMMENTS.md`
@@ -309,7 +306,7 @@ docker compose logs -f
 ## Recommended First End-to-End Test
 
 1. Start the stack
-2. Add `codex_auth_json`
+2. Add `deepseek_api_key` (or your chosen provider's API key)
 3. Add `github_developer_token`
 4. Create an engineer and start it
 5. Create a project with a GitHub repo
